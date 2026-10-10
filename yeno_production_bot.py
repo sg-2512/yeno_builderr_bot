@@ -16,6 +16,7 @@ import json
 import math
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -23,6 +24,8 @@ from typing import Any
 # STRATEGY HYPERPARAMETERS
 # ==============================================================================
 MAX_BUY_CASH_CEILING = 4.88            # Safe buffer below $5.00 fee-inclusive cap
+BUY_HEADROOM_PER_SHARE = 0.015         # Buffer against 250ms quote jumps (prevents sub-minOrderSize rejections)
+MAX_HOLD_SECONDS = 30.0                # Max time to hold before exiting to free capital
 CASH_UTILIZATION_RATIO = 0.94          # Max fraction of available cash to risk per BUY
 TARGET_VOLUME_USD = 1000.0             # Official volume qualification target
 MAX_SPREAD_USD = 0.03                  # Strict spread filter (reject wide spreads)
@@ -105,6 +108,7 @@ def _estimate_sell(bids: Any, shares: float) -> tuple[float, float] | None:
 
 class ProductionTradingBot:
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.market_id: str | None = None
         self.position_was_open: bool = False
         self.completed_cycles: int = 0
@@ -112,13 +116,23 @@ class ProductionTradingBot:
         self.last_buy_attempt_at: float = -math.inf
         self.qualified_and_flat: bool = False
         self.price_history: list[tuple[float, float]] = []
+        self.exiting: bool = False
+        self.position_entered_at: float = -math.inf
 
     def decide(self, observation: dict[str, Any]) -> dict[str, Any]:
-        """Entry point for /decide. Fully exception-safe with sub-millisecond execution."""
-        try:
-            return self._decide_impl(observation)
-        except Exception:
-            return {"action": "HOLD"}
+        """Entry point for /decide. Thread-safe with latched emergency exit on error."""
+        with self._lock:
+            try:
+                return self._decide_impl(observation)
+            except Exception:
+                # Jaswanth safety net: if holding a position and parsing fails, never get stranded
+                try:
+                    if isinstance(observation, dict) and observation.get("account", {}).get("position") is not None:
+                        self.exiting = True
+                        return {"action": "SELL"}
+                except Exception:
+                    pass
+                return {"action": "HOLD"}
 
     def _decide_impl(self, observation: dict[str, Any]) -> dict[str, Any]:
         market = observation.get("market", {})
@@ -155,11 +169,19 @@ class ProductionTradingBot:
             self.last_flat_at = -math.inf
             self.last_buy_attempt_at = -math.inf
             self.price_history = []
+            self.exiting = False
+            self.position_entered_at = -math.inf
 
         # Cycle transition tracking
-        if position is None and self.position_was_open:
-            self.completed_cycles += 1
-            self.last_flat_at = now
+        if position is None:
+            self.exiting = False
+            self.position_entered_at = -math.inf
+            if self.position_was_open:
+                self.completed_cycles += 1
+                self.last_flat_at = now
+        else:
+            if not self.position_was_open:
+                self.position_entered_at = now
         self.position_was_open = position is not None
 
         # ----------------------------------------------------------------------
@@ -171,17 +193,34 @@ class ProductionTradingBot:
             if shares <= 1e-9:
                 return {"action": "HOLD"}
 
+            # Learning 1 (Jaswanth): Latched Exit — once an exit triggers, keep returning SELL until flat!
+            if self.exiting:
+                return {"action": "SELL"}
+
             # If target volume was reached while holding, prioritize immediate exit!
             if eligible_vol >= TARGET_VOLUME_USD:
+                self.exiting = True
+                return {"action": "SELL"}
+
+            # Emergency Time Exit: Force SELL before the 15-second pre-expiry lock!
+            if seconds_to_close <= EMERGENCY_EXIT_SECONDS:
+                self.exiting = True
+                return {"action": "SELL"}
+
+            # Learning 3 (RowletCC): Reverse Signal Cut — dump immediately if BTC gap flips violently
+            if isinstance(reference, dict) and not bool(reference.get("targetProvisional", True)):
+                cur_gap = float(reference.get("btcMidUsd", 0)) - float(reference.get("openingTargetUsd", 0))
+                if (side == "YES" and cur_gap < -BASE_MIN_GAP_USD) or (side == "NO" and cur_gap > BASE_MIN_GAP_USD):
+                    self.exiting = True
+                    return {"action": "SELL"}
+
+            # Learning 4 (RowletCC): Max Hold Time Cutoff — don't hold past 30s to avoid chopping
+            if self.position_entered_at > 0 and (now - self.position_entered_at) >= MAX_HOLD_SECONDS:
+                self.exiting = True
                 return {"action": "SELL"}
 
             outcome_book = books.get(side, {})
             bids = outcome_book.get("bids", [])
-
-            # Emergency Time Exit: Force SELL before the 15-second pre-expiry lock!
-            # Settling at expiry awards $0 volume; we must sell into the book.
-            if seconds_to_close <= EMERGENCY_EXIT_SECONDS:
-                return {"action": "SELL"}
 
             executable = _estimate_sell(bids, shares)
             if executable is not None:
@@ -192,24 +231,26 @@ class ProductionTradingBot:
 
                 # Condition A: Take-Profit (Lock in profit above all roundtrip fees)
                 if full_cycle_pnl >= (TAKE_PROFIT_PER_SHARE_USD * shares) - 1e-9:
+                    self.exiting = True
                     return {"action": "SELL"}
 
                 # Condition B: Breakeven Exit when approaching expiry (t <= 55s)
-                # Breakeven volume is 100% win in this competition!
                 if seconds_to_close <= 55.0 and full_cycle_pnl >= -1e-9:
+                    self.exiting = True
                     return {"action": "SELL"}
 
                 # Condition C: Stop-Loss (Protect capital against trend reversals)
                 if full_cycle_pnl <= -(STOP_LOSS_PER_SHARE_USD * shares) + 1e-9:
+                    self.exiting = True
                     return {"action": "SELL"}
 
                 # Condition D: Forced Time Exit
                 if seconds_to_close <= FORCED_EXIT_SECONDS:
+                    self.exiting = True
                     return {"action": "SELL"}
             else:
-                # If exact depth is not visible on L2 but seconds <= 40, signal SELL
-                # allowing evaluator to match partial bids before the 15s freeze.
                 if seconds_to_close <= 40.0:
+                    self.exiting = True
                     return {"action": "SELL"}
 
             return {"action": "HOLD"}
@@ -354,14 +395,16 @@ class ProductionTradingBot:
         if immediate_roundtrip_loss > 0.065 * optimal_shares + 1e-9:
             return {"action": "HOLD"}
 
-        # ----------------------------------------------------------------------
-        # 7. Issue Valid BUY Decision
-        # ----------------------------------------------------------------------
+        # Learning 2 (Jaswanth): Add execution headroom buffer to prevent sub-minOrderSize rejections
+        # during 250ms quote movement, capped strictly under max_spend_budget and MAX_BUY_CASH_CEILING
+        headroom = BUY_HEADROOM_PER_SHARE * optimal_shares
+        funded_cash = min(max_spend_budget, optimal_cash + headroom)
+
         self.last_buy_attempt_at = now
         return {
             "action": "BUY",
             "outcome": side,
-            "maxCashUsd": round(optimal_cash, 6),
+            "maxCashUsd": round(funded_cash, 6),
         }
 
 
