@@ -55,15 +55,29 @@ def evaluate_real_historical_markets() -> dict[str, float]:
         tau2 = 3.0  # 3 minutes remaining
 
         # Calibrated entry condition: significant gap and sufficient bankroll
-        if abs(gap2) >= 18.0 and cash >= 3.0:
+        if abs(gap2) >= 18.0 and cash >= 2.2:
             side = "YES" if gap2 > 0 else "NO"
             z2 = (gap2 if side == "YES" else -gap2) / (45.0 * math.sqrt(tau2))
             p2 = _normal_cdf(z2)
             ask = min(0.85, max(0.35, round(p2 + 0.01, 2)))
 
-            spend = min(4.88, cash - 0.15)
+            # Tiered Anti-Ruin Bankroll Sizing
+            if cash < 7.0:
+                tier_budget = min(2.75, max(2.20, cash * 0.40))
+            elif cash < 14.0:
+                tier_budget = min(4.20, cash * 0.45)
+            else:
+                tier_budget = 4.88
+
+            spend = min(4.88, min(tier_budget, max(0.0, cash - 0.15)))
             fee_est = (0.07 * ask * (1.0 - ask)) + (ask * 0.01)
             shares = math.floor(spend / (ask + fee_est))
+
+            # Maintain min 5 shares if affordable
+            if shares < 5:
+                needed = 5 * (ask + fee_est) + 0.05
+                if cash >= needed and cash >= 3.0:
+                    shares = 5
 
             if shares >= 5:
                 buy_gross = shares * ask
@@ -176,15 +190,28 @@ def evaluate_rolling_24h_windows() -> None:
             s2 = bars[2]["close"]
             gap2 = s2 - s0
 
-            if abs(gap2) >= 18.0 and cash >= 3.0:
+            if abs(gap2) >= 18.0 and cash >= 2.2:
                 side = "YES" if gap2 > 0 else "NO"
                 z2 = (gap2 if side == "YES" else -gap2) / (45.0 * math.sqrt(3.0))
                 p2 = _normal_cdf(z2)
                 ask = min(0.85, max(0.35, round(p2 + 0.01, 2)))
 
-                spend = min(4.88, cash - 0.15)
+                # Tiered Anti-Ruin Bankroll Sizing
+                if cash < 7.0:
+                    tier_budget = min(2.75, max(2.20, cash * 0.40))
+                elif cash < 14.0:
+                    tier_budget = min(4.20, cash * 0.45)
+                else:
+                    tier_budget = 4.88
+
+                spend = min(4.88, min(tier_budget, max(0.0, cash - 0.15)))
                 fee_est = (0.07 * ask * (1.0 - ask)) + (ask * 0.01)
                 shares = math.floor(spend / (ask + fee_est))
+
+                if shares < 5:
+                    needed = 5 * (ask + fee_est) + 0.05
+                    if cash >= needed and cash >= 3.0:
+                        shares = 5
 
                 if shares >= 5:
                     buy_gross = shares * ask

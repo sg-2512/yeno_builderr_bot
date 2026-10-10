@@ -65,6 +65,24 @@ def _parse_book_levels(rows: Any, *, reverse: bool) -> list[tuple[float, float]]
     return sorted(levels, reverse=reverse)
 
 
+def _compute_micro_price(best_bid: float, best_ask: float, v_bid: float, v_ask: float) -> float:
+    """Stoikov (2018) Volume-Weighted Micro-Price Estimator."""
+    total = v_bid + v_ask
+    if total <= 1e-9:
+        return (best_bid + best_ask) / 2.0
+    return (v_bid * best_ask + v_ask * best_bid) / total
+
+
+def _compute_obi(parsed_bids: list[tuple[float, float]], parsed_asks: list[tuple[float, float]], depth: int = 2) -> float:
+    """Cont, Kukanov & Stoikov (2014) Order Book Imbalance (OBI) metric."""
+    v_bid = sum(qty for _, qty in parsed_bids[:depth])
+    v_ask = sum(qty for _, qty in parsed_asks[:depth])
+    total = v_bid + v_ask
+    if total <= 1e-9:
+        return 0.0
+    return (v_bid - v_ask) / total
+
+
 def _compute_fees(fills: list[tuple[float, float]]) -> float:
     """Compute exact two-layer fees: Polymarket dynamic crypto taker fee + YeNo 1% overlay."""
     gross = sum(price * shares for price, shares in fills)
@@ -229,22 +247,26 @@ class ProductionTradingBot:
                 already_received = float(position.get("sell_gross_usd", 0.0)) - float(position.get("sell_fees_usd", 0.0))
                 full_cycle_pnl = already_received + sell_gross - sell_fees - paid
 
-                # Condition A: Take-Profit (Lock in profit above all roundtrip fees)
-                if full_cycle_pnl >= (TAKE_PROFIT_PER_SHARE_USD * shares) - 1e-9:
+                # Avellaneda-Stoikov Dynamic Reservation Price Exit Engine:
+                # - Early holding (t > 85s): Target full profit (+0.02 / share)
+                # - Mid holding (60s < t <= 85s): Take early profit (+0.01 / share)
+                # - Approaching expiry (45s < t <= 60s): Breakeven exit (>= 0.00)
+                dynamic_tp = (
+                    TAKE_PROFIT_PER_SHARE_USD
+                    if seconds_to_close > 85.0
+                    else (0.01 if seconds_to_close > 60.0 else 0.00)
+                )
+
+                if full_cycle_pnl >= (dynamic_tp * shares) - 1e-9:
                     self.exiting = True
                     return {"action": "SELL"}
 
-                # Condition B: Breakeven Exit when approaching expiry (t <= 55s)
-                if seconds_to_close <= 55.0 and full_cycle_pnl >= -1e-9:
-                    self.exiting = True
-                    return {"action": "SELL"}
-
-                # Condition C: Stop-Loss (Protect capital against trend reversals)
+                # Stop-Loss: Protect capital against severe reversals
                 if full_cycle_pnl <= -(STOP_LOSS_PER_SHARE_USD * shares) + 1e-9:
                     self.exiting = True
                     return {"action": "SELL"}
 
-                # Condition D: Forced Time Exit
+                # Forced Time Exit: Guarantee flat liquidation before expiry lock
                 if seconds_to_close <= FORCED_EXIT_SECONDS:
                     self.exiting = True
                     return {"action": "SELL"}
@@ -290,32 +312,50 @@ class ProductionTradingBot:
         target_usd = float(reference["openingTargetUsd"])
         gap = btc_mid - target_usd
 
+        # Track BTC price history for real-time volatility & multi-horizon momentum
+        self.price_history.append((now, btc_mid))
+        self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
+
         # Calculate remaining time in minutes
         tau_min = max(0.5, seconds_to_close / 60.0)
+
+        # Real-Time Volatility Adaptation: estimate realized volatility from rolling price history
+        if len(self.price_history) >= 4:
+            history_prices = [p for _, p in self.price_history]
+            rolling_range = max(history_prices) - min(history_prices)
+            dynamic_sigma = max(25.0, min(120.0, rolling_range * 1.5))
+        else:
+            dynamic_sigma = BTC_SIGMA_PER_MIN_USD
+
         # Dynamic volatility over remaining time: σ * sqrt(τ)
-        vol_expected_usd = max(15.0, BTC_SIGMA_PER_MIN_USD * math.sqrt(tau_min))
+        vol_expected_usd = max(15.0, dynamic_sigma * math.sqrt(tau_min))
 
         # Normalized Z-Score of the BTC price relative to the strike target
         z = gap / vol_expected_usd
         prob_yes = _normal_cdf(z)
         prob_no = 1.0 - prob_yes
 
-        # Minimum required gap to trade
-        if abs(gap) < BASE_MIN_GAP_USD:
+        # Minimum required gap to trade: adaptive to volatility regime
+        min_required_gap = max(BASE_MIN_GAP_USD, dynamic_sigma * 0.35 * math.sqrt(tau_min))
+        if abs(gap) < min_required_gap:
             return {"action": "HOLD"}
 
-        # Track BTC price history for trend momentum / anti-knife check
-        self.price_history.append((now, btc_mid))
-        self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 45.0]
-
-        older_prices = [p_h for t_h, p_h in self.price_history if now - t_h >= 3.0]
-        if older_prices:
-            ref_past_price = older_prices[-1]
-            # Don't buy YES if BTC is currently dumping
-            if gap > 0 and btc_mid < ref_past_price - 12.0:
+        # Horizon 1: Micro-Momentum (3 seconds)
+        p_3s = [p_h for t_h, p_h in self.price_history if now - t_h >= 3.0]
+        if p_3s:
+            ref_3s = p_3s[-1]
+            if gap > 0 and btc_mid < ref_3s - 10.0:
                 return {"action": "HOLD"}
-            # Don't buy NO if BTC is currently pumping
-            if gap < 0 and btc_mid > ref_past_price + 12.0:
+            if gap < 0 and btc_mid > ref_3s + 10.0:
+                return {"action": "HOLD"}
+
+        # Horizon 2: Tactical Momentum (15 seconds)
+        p_15s = [p_h for t_h, p_h in self.price_history if now - t_h >= 15.0]
+        if p_15s:
+            ref_15s = p_15s[-1]
+            if gap > 0 and btc_mid < ref_15s - 14.0:
+                return {"action": "HOLD"}
+            if gap < 0 and btc_mid > ref_15s + 14.0:
                 return {"action": "HOLD"}
 
         # Select direction with highest probability
@@ -338,9 +378,32 @@ class ProductionTradingBot:
         if best_bid < 0.48:
             return {"action": "HOLD"}
 
+        # Cross-Book Parity Check: Verify complementary book agreement (reject contradictory books)
+        other_side = "NO" if side == "YES" else "YES"
+        other_book = books.get(other_side, {})
+        other_bids = other_book.get("bids", [])
+        parsed_other_bids = _parse_book_levels(other_bids, reverse=True)
+        if parsed_other_bids:
+            other_best_bid = parsed_other_bids[0][0]
+            if other_best_bid > 0.52:
+                return {"action": "HOLD"}
+
         # Spread Filter: Reject wide spreads (spread > 0.03) to prevent latency loss
         spread = best_ask - best_bid
         if spread > MAX_SPREAD_USD + 1e-9:
+            return {"action": "HOLD"}
+
+        # Stoikov (2018) Micro-Price & Cont et al. (2014) Order Book Imbalance (OBI) Filter
+        v_bid_top = sum(size for _, size in parsed_bids[:2])
+        v_ask_top = sum(size for _, size in parsed_asks[:2])
+        obi = _compute_obi(parsed_bids, parsed_asks, depth=2)
+        p_micro = _compute_micro_price(best_bid, best_ask, v_bid_top, v_ask_top)
+        p_mid = (best_ask + best_bid) / 2.0
+
+        # Reject if severe ask pressure (OBI < -0.30) or micro-price signals downward tick
+        if obi < -0.30:
+            return {"action": "HOLD"}
+        if p_micro < p_mid - 0.008:
             return {"action": "HOLD"}
 
         # Price Range Filter: Trade where fee convexity and time decay are optimal
@@ -348,12 +411,24 @@ class ProductionTradingBot:
             return {"action": "HOLD"}
 
         # ----------------------------------------------------------------------
-        # 6. Dynamic Position Sizing (Volume Maximizer & Cash Preserver)
+        # 6. Dynamic Position Sizing (Tiered Anti-Ruin & Volume Acceleration Engine)
         # ----------------------------------------------------------------------
-        # Adaptive Risk Scaling: Use higher budget when bankroll is strong; scale down under drawdown to ensure survival
         rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
-        available_cash_limit = max(0.0, cash_usd - 0.15) if cash_usd < 5.0 else cash_usd * CASH_UTILIZATION_RATIO
-        max_spend_budget = min(rule_max_buy, MAX_BUY_CASH_CEILING, available_cash_limit)
+        available_cash_limit = max(0.0, cash_usd - 0.15)
+
+        # Tiered Anti-Ruin Bankroll Sizing:
+        # Prevents hitting the 5-share paralysis floor ($3.00) while maximizing growth & volume
+        if cash_usd < 7.0:
+            # Tier 1 (Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
+            tier_budget = min(2.75, max(2.20, cash_usd * 0.40))
+        elif cash_usd < 14.0:
+            # Tier 2 (Conservative Growth): Size ~45% of bankroll up to $4.20
+            tier_budget = min(4.20, cash_usd * 0.45)
+        else:
+            # Tier 3 (Turbo Volume Acceleration): Full capital cushion allows max $4.88 cap
+            tier_budget = MAX_BUY_CASH_CEILING
+
+        max_spend_budget = min(rule_max_buy, MAX_BUY_CASH_CEILING, tier_budget, available_cash_limit)
 
         # Target Finish Sizing Governor: If approaching $1,000, size only what's needed
         remaining_vol_to_qualify = TARGET_VOLUME_USD - eligible_vol
