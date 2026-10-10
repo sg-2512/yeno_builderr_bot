@@ -25,24 +25,24 @@ from typing import Any
 # ==============================================================================
 MAX_BUY_CASH_CEILING = 4.88            # Safe buffer below $5.00 fee-inclusive cap
 BUY_HEADROOM_PER_SHARE = 0.015         # Buffer against 250ms quote jumps (prevents sub-minOrderSize rejections)
-MAX_HOLD_SECONDS = 30.0                # Max time to hold before exiting to free capital
-CASH_UTILIZATION_RATIO = 0.94          # Max fraction of available cash to risk per BUY
+MAX_HOLD_SECONDS = 90.0                # Max hold time to allow theta decay & trend to mature
+CASH_UTILIZATION_RATIO = 0.95          # Max fraction of available cash to risk per BUY
 TARGET_VOLUME_USD = 1000.0             # Official volume qualification target
 MAX_SPREAD_USD = 0.03                  # Strict spread filter (reject wide spreads)
-MAX_ENTRY_PRICE = 0.74                 # Asymmetric risk/reward: buy before contract is overbought
-MIN_ENTRY_PRICE = 0.30                 # Avoid low probability lotteries
-BASE_MIN_GAP_USD = 15.0                # Base BTC price vs strike gap (in USD)
-BTC_SIGMA_PER_MIN_USD = 45.0           # Estimated BTC 1-minute price volatility ($40-$50)
+MAX_ENTRY_PRICE = 0.85                 # High-conviction ceiling: capture strong trends
+MIN_ENTRY_PRICE = 0.35                 # Avoid low probability lotteries
+BASE_MIN_GAP_USD = 18.0                # Real-data calibrated strike gap threshold
+BTC_SIGMA_PER_MIN_USD = 45.0           # Calibrated BTC 1-minute volatility
 MIN_EDGE_MARGIN = 0.015                # Required mathematical probability edge above fees
-MAX_CYCLES_PER_MARKET = 4              # Max completed roundtrips in a single 5m market
-ENTRY_MAX_SECONDS_TO_CLOSE = 210.0     # Scan for entries once trend establishes
-ENTRY_MIN_SECONDS_TO_CLOSE = 50.0      # Cut off new entries to guarantee time for exit
-FORCED_EXIT_SECONDS = 42.0             # Standard exit threshold before expiry decay
-EMERGENCY_EXIT_SECONDS = 26.0          # Hard emergency exit: sweep bids before 15s freeze
-REENTRY_COOLDOWN_SECONDS = 1.5         # Wait between trades to avoid whipsaw entries
+MAX_CYCLES_PER_MARKET = 1              # Focus on 1 high-conviction trade per 5m round to eliminate churning
+ENTRY_MAX_SECONDS_TO_CLOSE = 210.0     # Scan for entries once trend establishes (t <= 3.5 min)
+ENTRY_MIN_SECONDS_TO_CLOSE = 65.0      # Cut off entries with <= 65s left to guarantee exit runway
+FORCED_EXIT_SECONDS = 55.0             # Standard exit threshold before expiry decay
+EMERGENCY_EXIT_SECONDS = 25.0          # Hard emergency exit: sweep bids before 15s freeze
+REENTRY_COOLDOWN_SECONDS = 2.0         # Wait between trades to avoid whipsaw entries
 MAX_REFERENCE_AGE_SECONDS = 1.5        # Max allowable staleness of BTC reference data
-STOP_LOSS_PER_SHARE_USD = 0.14         # Allow trade room to breathe beyond bid-ask spread
-TAKE_PROFIT_PER_SHARE_USD = 0.00       # Sell at breakeven or profit: lock in volume at zero net cost
+STOP_LOSS_PER_SHARE_USD = 0.10         # Controlled loss limit per share
+TAKE_PROFIT_PER_SHARE_USD = 0.02       # Lock in net profit (+2 cents/share after all fees)
 
 
 def _normal_cdf(z: float) -> float:
@@ -352,8 +352,7 @@ class ProductionTradingBot:
         # ----------------------------------------------------------------------
         # Adaptive Risk Scaling: Use higher budget when bankroll is strong; scale down under drawdown to ensure survival
         rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
-        adaptive_ratio = 0.92 if cash_usd >= 7.0 else (0.75 if cash_usd >= 4.5 else 0.55)
-        available_cash_limit = cash_usd * adaptive_ratio
+        available_cash_limit = max(0.0, cash_usd - 0.15) if cash_usd < 5.0 else cash_usd * CASH_UTILIZATION_RATIO
         max_spend_budget = min(rule_max_buy, MAX_BUY_CASH_CEILING, available_cash_limit)
 
         # Target Finish Sizing Governor: If approaching $1,000, size only what's needed
@@ -391,8 +390,8 @@ class ProductionTradingBot:
 
         exit_gross, exit_fees = immediate_exit
         immediate_roundtrip_loss = optimal_cash - (exit_gross - exit_fees)
-        # Reject if instantaneous spread loss exceeds $0.065 per share
-        if immediate_roundtrip_loss > 0.065 * optimal_shares + 1e-9:
+        # Reject if instantaneous spread loss exceeds $0.075 per share (allows 1c-2c spreads, blocks wide 3c+)
+        if immediate_roundtrip_loss > 0.075 * optimal_shares + 1e-9:
             return {"action": "HOLD"}
 
         # Learning 2 (Jaswanth): Add execution headroom buffer to prevent sub-minOrderSize rejections
