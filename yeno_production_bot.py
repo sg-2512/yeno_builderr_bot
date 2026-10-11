@@ -383,23 +383,26 @@ class ProductionTradingBot:
         # Calculate remaining time in minutes
         tau_min = max(0.5, seconds_to_close / 60.0)
 
+        # Price Scale Factor relative to baseline $80,000 BTC benchmark
+        p_scale = max(0.12, min(1.5, btc_mid / 80000.0))
+
         # Real-Time Volatility Adaptation: estimate realized volatility from rolling price history
         if len(self.price_history) >= 4:
             history_prices = [p for _, p in self.price_history]
             rolling_range = max(history_prices) - min(history_prices)
-            dynamic_sigma = max(28.0, min(120.0, rolling_range * 1.2))
+            dynamic_sigma = max(28.0 * p_scale, min(180.0 * p_scale, rolling_range * 1.2))
         else:
-            dynamic_sigma = 45.0
+            dynamic_sigma = 45.0 * p_scale
 
         # Dynamic Volatility-Scaled Spike Shield: Reject black swan flash wicks without discarding normal volatility
-        spike_limit = max(115.0, dynamic_sigma * 2.8)
+        spike_limit = max(140.0 * p_scale, dynamic_sigma * 4.0)
         if len(self.price_history) >= 2:
             hist_prices = [p for _, p in self.price_history]
             if max(hist_prices) - min(hist_prices) >= spike_limit:
                 return {"action": "HOLD"}
 
         # Volatility-Scaled Base Regime Gap
-        min_required_gap = max(10.5, min(30.0, dynamic_sigma * 0.22))
+        min_required_gap = max(10.5 * p_scale, min(30.0 * p_scale, dynamic_sigma * 0.22))
 
         # Continuous Volume Run-Rate Governor & High-Cash Finisher
         elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0

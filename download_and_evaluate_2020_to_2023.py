@@ -155,11 +155,11 @@ def evaluate_single_24h_day(candles_24h: list[dict[str, float]], day_label: str)
         # Price scale factor relative to benchmark $80,000 BTC
         p_scale = max(0.12, min(1.5, s0 / 80000.0))
 
-        sigma = max(28.0 * p_scale, min(120.0 * p_scale, local_range * 1.2))
+        sigma = max(28.0 * p_scale, min(180.0 * p_scale, local_range * 1.2))
 
         # Dynamic Volatility-Scaled Gap (with Basis-Point Scaling)
         min_gap = max(10.5 * p_scale, min(30.0 * p_scale, sigma * 0.22))
-        spike_limit = max(115.0 * p_scale, sigma * 2.8)
+        spike_limit = max(140.0 * p_scale, sigma * 4.0)
 
         # Continuous Volume Run-Rate Governor
         expected_vol = (m / 288.0) * 1000.0
