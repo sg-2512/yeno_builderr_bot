@@ -497,6 +497,16 @@ class ProductionTradingBot:
         bids = outcome_book.get("bids", [])
         min_order_size = float(outcome_book.get("minOrderSize", 5.0))
 
+        # Builderr Rule 05: Reject order books older than two seconds or future-stamped
+        book_observed_at = outcome_book.get("observedAt", outcome_book.get("timestamp"))
+        if book_observed_at is not None:
+            try:
+                b_t = float(book_observed_at)
+                if now - b_t > 2.0 or b_t > now + 1e-9:
+                    return {"action": "HOLD"}
+            except (TypeError, ValueError):
+                pass
+
         parsed_asks = _parse_book_levels(asks, reverse=False)
         parsed_bids = _parse_book_levels(bids, reverse=True)
         if not parsed_asks or not parsed_bids:
