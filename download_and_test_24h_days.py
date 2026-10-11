@@ -106,10 +106,11 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
         s2 = bars[2]["close"]
         gap2 = s2 - s0
 
-        # Extreme Volatility Spike Shield:
+        # Multi-bar Volatility Spike Shield (bars 0, 1, 2)
         hl0 = abs(bars[0]["high"] - bars[0]["low"])
         hl1 = abs(bars[1]["high"] - bars[1]["low"])
-        if max(hl0, hl1) >= 85.0:
+        hl2 = abs(bars[2]["high"] - bars[2]["low"])
+        if max(hl0, hl1, hl2) >= 70.0:
             continue
 
         if abs(gap2) >= 16.0 and cash >= 1.50:
@@ -159,6 +160,8 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
                     s4 = bars[4]["close"]
                     gap4 = s4 - s0
 
+                    momentum_decay = (gap3 < gap2 * 0.4 if side == "YES" else gap3 > gap2 * 0.4)
+
                     # 1. Take Profit (+1c/share profit lock)
                     if pnl3 >= 0.01 * shares:
                         cash += proceeds3
@@ -166,15 +169,14 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
                         cycles += 1
                         consecutive_losses = 0
                         wins += 1
-                    # 2. Dynamic Stop-Loss (-10c/share limit to prevent 100% loss)
-                    elif pnl3 <= -0.10 * shares:
+                    # 2. Dual-Confirmation Reversal Cut: Loss confirmed AND momentum decayed significantly
+                    elif pnl3 <= -0.10 * shares and momentum_decay:
                         cash += proceeds3
                         vol += buy_gross + (shares * bid3)
                         cycles += 1
                         losses += 1
                         consecutive_losses += 1
-                        if consecutive_losses >= 3:
-                            cooldown_until_market = m + 3
+                        cooldown_until_market = m + 2
                     else:
                         in_the_money = (gap4 > 0 if side == "YES" else gap4 < 0)
                         if in_the_money:
@@ -185,8 +187,7 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
                             bid4 = max(0.04, min(0.15, 0.10 - min(0.06, abs(gap4) * 0.001)))
                             losses += 1
                             consecutive_losses += 1
-                            if consecutive_losses >= 3:
-                                cooldown_until_market = m + 3
+                            cooldown_until_market = m + 2
 
                         proceeds4 = (shares * bid4) - fees(bid4, shares)
                         cash += proceeds4

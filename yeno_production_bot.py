@@ -250,8 +250,11 @@ class ProductionTradingBot:
                 else:
                     self.consecutive_losses += 1
                     if self.consecutive_losses >= 3:
-                        # Cool down for 15 minutes (900 seconds) to bypass violent whipsaw regimes
+                        # Extended cooldown for 15 minutes (900 seconds) on 3 consecutive losses
                         self.cooldown_until = now + 900.0
+                    else:
+                        # Aftershock cooldown for 10 minutes (600 seconds) on any loss to avoid violent double-whammy
+                        self.cooldown_until = now + 600.0
                 self.last_cash_usd = cash_usd
         else:
             if not self.position_was_open:
@@ -377,10 +380,10 @@ class ProductionTradingBot:
         self.price_history.append((now, btc_mid))
         self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
 
-        # Extreme Volatility Spike Shield: If BTC moved >= $85 in last 60s, shield capital against flash wicks
+        # Extreme Volatility Spike Shield: If BTC moved >= $70 in last 60s, shield capital against flash wicks
         if len(self.price_history) >= 2:
             hist_prices = [p for _, p in self.price_history]
-            if max(hist_prices) - min(hist_prices) >= 85.0:
+            if max(hist_prices) - min(hist_prices) >= 70.0:
                 return {"action": "HOLD"}
 
         # Calculate remaining time in minutes
