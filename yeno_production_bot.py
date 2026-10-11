@@ -253,12 +253,8 @@ class ProductionTradingBot:
                     self.consecutive_losses = 0
                 else:
                     self.consecutive_losses += 1
-                    if cash_usd < 6.0 or self.consecutive_losses >= 2:
-                        # 2 market rounds (10 minutes) cooldown when cash is low or sequence risk spikes
-                        self.cooldown_until = now + 600.0
-                    else:
-                        # 1 market round (5 minutes) cooldown on single loss
-                        self.cooldown_until = now + 300.0
+                    # Cooldown on loss: 10 minutes (2 rounds) to prevent whipsaw clustering
+                    self.cooldown_until = now + 600.0
                 self.last_cash_usd = cash_usd
         else:
             if not self.position_was_open:
@@ -384,12 +380,6 @@ class ProductionTradingBot:
         self.price_history.append((now, btc_mid))
         self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
 
-        # Extreme Volatility Spike Shield: If BTC moved >= $115 in last 60s, shield capital against flash wicks
-        if len(self.price_history) >= 2:
-            hist_prices = [p for _, p in self.price_history]
-            if max(hist_prices) - min(hist_prices) >= 115.0:
-                return {"action": "HOLD"}
-
         # Calculate remaining time in minutes
         tau_min = max(0.5, seconds_to_close / 60.0)
 
@@ -397,24 +387,49 @@ class ProductionTradingBot:
         if len(self.price_history) >= 4:
             history_prices = [p for _, p in self.price_history]
             rolling_range = max(history_prices) - min(history_prices)
-            dynamic_sigma = max(35.0, min(100.0, rolling_range * 1.2))
+            dynamic_sigma = max(28.0, min(120.0, rolling_range * 1.2))
         else:
             dynamic_sigma = 45.0
 
-        # Dynamic Regime Adaptation
-        if dynamic_sigma < 42.0:
-            min_required_gap = 13.0
-        elif dynamic_sigma < 65.0:
-            min_required_gap = 14.0
-        else:
-            min_required_gap = 16.0
+        # Dynamic Volatility-Scaled Spike Shield: Reject black swan flash wicks without discarding normal volatility
+        spike_limit = max(115.0, dynamic_sigma * 2.8)
+        if len(self.price_history) >= 2:
+            hist_prices = [p for _, p in self.price_history]
+            if max(hist_prices) - min(hist_prices) >= spike_limit:
+                return {"action": "HOLD"}
 
-        # Two-Tier Closing Sprint Accelerator
+        # Dynamic Base Regime Gap
+        if dynamic_sigma < 36.0:
+            min_required_gap = 10.5
+        elif dynamic_sigma < 50.0:
+            min_required_gap = 12.5
+        else:
+            min_required_gap = 15.0
+
+        # Continuous Volume Run-Rate Governor & High-Cash Finisher
         elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0
-        if elapsed_hours >= 17.5 and cash_usd >= 15.0 and eligible_vol < TARGET_VOLUME_USD:
-            min_required_gap = max(9.5, min_required_gap - 4.5)
-        if elapsed_hours >= 20.0 and cash_usd >= 20.0 and eligible_vol < TARGET_VOLUME_USD:
-            min_required_gap = max(7.5, min_required_gap - 6.5)
+        expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
+        if cash_usd >= 10.5:
+            if elapsed_hours >= 6.0 and eligible_vol < expected_vol:
+                min_required_gap = max(7.5, min_required_gap - 3.0)
+            if elapsed_hours >= 12.0 and eligible_vol < expected_vol:
+                min_required_gap = max(6.0, min_required_gap - 5.0)
+            if elapsed_hours >= 16.0 and eligible_vol < TARGET_VOLUME_USD:
+                min_required_gap = max(4.5, min_required_gap - 7.0)
+            if elapsed_hours >= 20.0 and eligible_vol < TARGET_VOLUME_USD:
+                min_required_gap = max(3.0, min_required_gap - 9.0)
+            if elapsed_hours >= 22.0 and eligible_vol < TARGET_VOLUME_USD:
+                min_required_gap = max(1.5, min_required_gap - 11.0)
+
+        # High-Cash Bankroll Acceleration & Decisive Finisher
+        if cash_usd >= 30.0 and elapsed_hours >= 12.0 and eligible_vol < expected_vol:
+            min_required_gap = max(3.0, min_required_gap - 5.0)
+        if cash_usd >= 25.0 and elapsed_hours >= 15.0 and eligible_vol < 850.0:
+            min_required_gap = max(2.0, min_required_gap - 8.0)
+        if cash_usd >= 20.0 and elapsed_hours >= 16.5 and eligible_vol < TARGET_VOLUME_USD:
+            min_required_gap = max(1.0, min_required_gap - 14.0)
+        elif cash_usd >= 15.0 and elapsed_hours >= 19.0 and eligible_vol < TARGET_VOLUME_USD:
+            min_required_gap = max(1.0, min_required_gap - 14.0)
 
         if abs(gap) < min_required_gap:
             return {"action": "HOLD"}
@@ -451,11 +466,12 @@ class ProductionTradingBot:
             ema_fast = _compute_ema(history_prices, period=5)
             ema_slow = _compute_ema(history_prices, period=15)
             slope = _compute_linear_slope(self.price_history)
+            ema_tol = 18.0 if (cash_usd >= 20.0 and elapsed_hours >= 16.5) else 7.0
 
             # Trend Direction Alignment:
             # When buying YES, price action must not be in a downward EMA cross or dumping velocity
             if gap > 0:
-                if ema_fast < ema_slow - 7.0 or slope < -0.40:
+                if ema_fast < ema_slow - ema_tol or slope < -0.40:
                     return {"action": "HOLD"}
                 # Overbought Exhaustion Guard: Avoid buying YES into an extreme parabolic top
                 if len(history_prices) >= 8 and _compute_rsi(history_prices) > 92.0:
@@ -463,7 +479,7 @@ class ProductionTradingBot:
 
             # When buying NO, price action must not be in an upward EMA cross or pumping velocity
             if gap < 0:
-                if ema_fast > ema_slow + 7.0 or slope > 0.40:
+                if ema_fast > ema_slow + ema_tol or slope > 0.40:
                     return {"action": "HOLD"}
                 # Oversold Bounce Guard: Avoid buying NO into an extreme capitulation bottom
                 if len(history_prices) >= 8 and _compute_rsi(history_prices) < 8.0:
@@ -529,12 +545,12 @@ class ProductionTradingBot:
 
         # Tiered Anti-Ruin Bankroll Sizing & Loss Throttling:
         # Prevents hitting the 5-share paralysis floor ($3.00) while maximizing growth & volume
-        if self.consecutive_losses >= 2 or cash_usd < 6.0:
+        if self.consecutive_losses >= 2 or cash_usd < 5.5:
             # Tier 1 (Loss Throttling / Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
-            tier_budget = min(2.50, max(1.80, cash_usd * 0.35))
-        elif cash_usd < 12.0:
-            # Tier 2 (Cautious Growth): Size ~38% of bankroll up to $3.50
-            tier_budget = min(3.50, cash_usd * 0.38)
+            tier_budget = min(2.40, max(1.80, cash_usd * 0.35))
+        elif cash_usd < 10.0:
+            # Tier 2 (Cautious Growth): Size ~38% of bankroll up to $3.40
+            tier_budget = min(3.40, cash_usd * 0.38)
         else:
             # Tier 3 (Turbo Volume Acceleration): Full capital cushion allows max $4.88 cap
             tier_budget = MAX_BUY_CASH_CEILING

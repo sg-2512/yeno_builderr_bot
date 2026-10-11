@@ -116,25 +116,43 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
         # Real-time Volatility Estimator (floor 35.0, ceiling 100.0)
         recent = rolling_history[-15:] if len(rolling_history) >= 15 else rolling_history
         local_range = max(recent) - min(recent) if len(recent) >= 5 else 45.0
-        sigma = max(35.0, min(100.0, local_range * 1.2))
+        sigma = max(28.0, min(120.0, local_range * 1.2))
 
-        # Dynamic Regime Adaptation
-        if sigma < 42.0:
-            min_gap = 13.0
-        elif sigma < 65.0:
-            min_gap = 14.0
+        # Dynamic Base Regime Gap
+        if sigma < 36.0:
+            min_gap = 10.5
+        elif sigma < 50.0:
+            min_gap = 12.5
         else:
-            min_gap = 16.0
+            min_gap = 15.0
 
-        spike_limit = 115.0
+        # Dynamic Volatility-Scaled Spike Shield
+        spike_limit = max(115.0, sigma * 2.8)
 
-        # Two-Tier Closing Sprint Accelerator
-        if m >= 210 and cash >= 15.0 and vol < 1000.0:
-            min_gap = max(9.5, min_gap - 4.5)
-        if m >= 240 and cash >= 20.0 and vol < 1000.0:
-            min_gap = max(7.5, min_gap - 6.5)
+        # Continuous Volume Run-Rate Governor
+        expected_vol = (m / 288.0) * 1000.0
+        if cash >= 10.5:
+            if m >= 72 and vol < expected_vol:           # Hour 6+
+                min_gap = max(7.5, min_gap - 3.0)
+            if m >= 144 and vol < expected_vol:          # Hour 12+
+                min_gap = max(6.0, min_gap - 5.0)
+            if m >= 192 and vol < 1000.0:                # Hour 16+
+                min_gap = max(4.5, min_gap - 7.0)
+            if m >= 240 and vol < 1000.0:                # Hour 20+
+                min_gap = max(3.0, min_gap - 9.0)
+            if m >= 264 and vol < 1000.0:                # Hour 22+
+                min_gap = max(1.5, min_gap - 11.0)
 
-        # Extreme Volatility Spike Shield
+        # High-Cash Bankroll Acceleration & Decisive Finisher
+        if cash >= 30.0 and m >= 144 and vol < expected_vol:
+            min_gap = max(3.0, min_gap - 5.0)
+        if cash >= 25.0 and m >= 180 and vol < 850.0:
+            min_gap = max(2.0, min_gap - 8.0)
+        if cash >= 20.0 and m >= 200 and vol < 1000.0:
+            min_gap = max(1.0, min_gap - 14.0)
+        elif cash >= 15.0 and m >= 228 and vol < 1000.0:
+            min_gap = max(1.0, min_gap - 14.0)
+
         hl0 = abs(bars[0]["high"] - bars[0]["low"])
         hl1 = abs(bars[1]["high"] - bars[1]["low"])
         hl2 = abs(bars[2]["high"] - bars[2]["low"])
@@ -148,25 +166,32 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
             if len(rolling_history) >= 8:
                 fast_ema = _compute_ema(rolling_history, period=5)
                 slow_ema = _compute_ema(rolling_history, period=15)
-                if side == "NO" and fast_ema > slow_ema + 7.0:
+                ema_tol = 18.0 if (cash >= 20.0 and m >= 200) else 7.0
+                if side == "NO" and fast_ema > slow_ema + ema_tol:
                     continue
-                if side == "YES" and fast_ema < slow_ema - 7.0:
+                if side == "YES" and fast_ema < slow_ema - ema_tol:
                     continue
 
             z2 = (gap2 if side == "YES" else -gap2) / (sigma * math.sqrt(3.0))
             p2 = _normal_cdf(z2)
 
-            ask_ceiling = 0.55 if cash < 4.0 else 0.82
+            if cash < 4.0:
+                ask_ceiling = 0.50
+            elif cash < 5.5:
+                ask_ceiling = 0.54
+            else:
+                ask_ceiling = 0.82
+
             max_affordable_ask = min(ask_ceiling, (cash - 0.10) / 5.2)
             if max_affordable_ask < 0.35:
                 continue
             ask = min(max_affordable_ask, max(0.40, round(p2 + 0.01, 2)))
 
             # Risk-Managed Bankroll Sizing
-            if cash < 6.0:
-                spend = min(2.50, max(1.80, cash * 0.35))
-            elif cash < 12.0:
-                spend = min(3.50, cash * 0.38)
+            if cash < 5.5:
+                spend = min(2.40, max(1.80, cash * 0.35))
+            elif cash < 10.0:
+                spend = min(3.40, cash * 0.38)
             else:
                 spend = 4.88
 
@@ -197,7 +222,6 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
 
                     s4 = bars[4]["close"]
                     gap4 = s4 - s0
-                    momentum_decay = (gap3 < gap2 * 0.4 if side == "YES" else gap3 > gap2 * 0.4)
 
                     # 1. Take Profit (+1c/share harvest)
                     if pnl3 >= 0.01 * shares:
@@ -207,13 +231,13 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
                         consecutive_losses = 0
                         wins += 1
                     # 2. Dual-Confirmation Stop Loss
-                    elif pnl3 <= -0.10 * shares and momentum_decay:
+                    elif pnl3 <= -0.10 * shares and (gap3 < -12.0 if side == "YES" else gap3 > 12.0):
                         cash += proceeds3
                         vol += buy_gross + (shares * bid3)
                         cycles += 1
                         losses += 1
                         consecutive_losses += 1
-                        cooldown_until_market = m + (2 if cash < 6.0 or consecutive_losses >= 2 else 1)
+                        cooldown_until_market = m + 2
                     else:
                         in_the_money = (gap4 > 0 if side == "YES" else gap4 < 0)
                         if in_the_money:
@@ -224,7 +248,7 @@ def evaluate_24h_day(candles: list[dict[str, float]], day_name: str) -> dict[str
                             bid4 = max(0.04, min(0.15, 0.10 - min(0.06, abs(gap4) * 0.001)))
                             losses += 1
                             consecutive_losses += 1
-                            cooldown_until_market = m + (2 if cash < 6.0 or consecutive_losses >= 2 else 1)
+                            cooldown_until_market = m + 2
 
                         proceeds4 = (shares * bid4) - fees(bid4, shares)
                         cash += proceeds4
