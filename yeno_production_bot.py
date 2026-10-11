@@ -383,8 +383,8 @@ class ProductionTradingBot:
         # Calculate remaining time in minutes
         tau_min = max(0.5, seconds_to_close / 60.0)
 
-        # Price Scale Factor relative to baseline $80,000 BTC benchmark
-        p_scale = max(0.12, min(1.5, btc_mid / 80000.0))
+        # Price Scale Factor relative to baseline $80,000 BTC benchmark (scales smoothly down to $3k BTC)
+        p_scale = max(0.035, min(1.5, btc_mid / 80000.0))
 
         # Real-Time Volatility Adaptation: estimate realized volatility from rolling price history
         if len(self.price_history) >= 4:
@@ -550,8 +550,8 @@ class ProductionTradingBot:
         if p_micro < p_mid - 0.008:
             return {"action": "HOLD"}
 
-        # Price Range Filter: Trade where fee convexity and time decay are optimal
-        effective_max_entry_price = 0.68 if cash_usd < 12.0 else MAX_ENTRY_PRICE
+        # Price Range Filter: Trade where fee convexity and time decay are optimal (0.54 startup cap for 1:1 convexity)
+        effective_max_entry_price = 0.54 if cash_usd < 12.0 else MAX_ENTRY_PRICE
         if not (MIN_ENTRY_PRICE <= best_ask <= effective_max_entry_price):
             return {"action": "HOLD"}
 
