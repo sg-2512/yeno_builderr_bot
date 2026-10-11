@@ -83,6 +83,50 @@ def _compute_obi(parsed_bids: list[tuple[float, float]], parsed_asks: list[tuple
     return (v_bid - v_ask) / total
 
 
+def _compute_ema(prices: list[float], period: int) -> float:
+    """Compute Exponential Moving Average (EMA) over a price series."""
+    if not prices:
+        return 0.0
+    alpha = 2.0 / (period + 1.0)
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = alpha * p + (1.0 - alpha) * ema
+    return ema
+
+
+def _compute_rsi(prices: list[float]) -> float:
+    """Compute Relative Strength Index (RSI) momentum indicator."""
+    if len(prices) < 4:
+        return 50.0
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i - 1]
+        if diff > 0:
+            gains += diff
+        else:
+            losses += abs(diff)
+    total = gains + losses
+    if total <= 1e-9:
+        return 50.0
+    return 100.0 * (gains / total)
+
+
+def _compute_linear_slope(history: list[tuple[float, float]]) -> float:
+    """Compute least-squares trend velocity (USD per second) from price history."""
+    if len(history) < 3:
+        return 0.0
+    t_vals = [t for t, _ in history]
+    p_vals = [p for _, p in history]
+    t_mean = sum(t_vals) / len(t_vals)
+    p_mean = sum(p_vals) / len(p_vals)
+    denom = sum((t - t_mean) ** 2 for t in t_vals)
+    if denom <= 1e-9:
+        return 0.0
+    numer = sum((t - t_mean) * (p - p_mean) for t, p in zip(t_vals, p_vals))
+    return numer / denom
+
+
 def _compute_fees(fills: list[tuple[float, float]]) -> float:
     """Compute exact two-layer fees: Polymarket dynamic crypto taker fee + YeNo 1% overlay."""
     gross = sum(price * shares for price, shares in fills)
@@ -380,6 +424,30 @@ class ProductionTradingBot:
                 return {"action": "HOLD"}
             if gap < 0 and btc_mid > ref_15s + 14.0:
                 return {"action": "HOLD"}
+
+        # Horizon 3: Technical Trend Analysis (EMA Alignment, Linear Velocity & RSI Exhaustion)
+        if len(self.price_history) >= 4:
+            history_prices = [p for _, p in self.price_history]
+            ema_fast = _compute_ema(history_prices, period=5)
+            ema_slow = _compute_ema(history_prices, period=15)
+            slope = _compute_linear_slope(self.price_history)
+
+            # Trend Direction Alignment:
+            # When buying YES, price action must not be in a downward EMA cross or dumping velocity
+            if gap > 0:
+                if ema_fast < ema_slow - 5.0 or slope < -0.40:
+                    return {"action": "HOLD"}
+                # Overbought Exhaustion Guard: Avoid buying YES into an extreme parabolic top
+                if len(history_prices) >= 8 and _compute_rsi(history_prices) > 92.0:
+                    return {"action": "HOLD"}
+
+            # When buying NO, price action must not be in an upward EMA cross or pumping velocity
+            if gap < 0:
+                if ema_fast > ema_slow + 5.0 or slope > 0.40:
+                    return {"action": "HOLD"}
+                # Oversold Bounce Guard: Avoid buying NO into an extreme capitulation bottom
+                if len(history_prices) >= 8 and _compute_rsi(history_prices) < 8.0:
+                    return {"action": "HOLD"}
 
         # Select direction with highest probability
         side = "YES" if gap > 0 else "NO"
