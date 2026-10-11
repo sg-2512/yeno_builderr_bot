@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 *.log
 competitors/
+data_2026_cache/
