@@ -183,6 +183,7 @@ class ProductionTradingBot:
         self.consecutive_losses: int = 0
         self.cooldown_until: float = -math.inf
         self.last_cash_usd: float = 10.0
+        self.session_start_time: float = -math.inf
 
     def decide(self, observation: dict[str, Any]) -> dict[str, Any]:
         """Entry point for /decide. Thread-safe with latched emergency exit on error."""
@@ -207,6 +208,9 @@ class ProductionTradingBot:
         reference = observation.get("reference")
         
         now = float(observation.get("timestamp", 0.0))
+        if self.session_start_time <= 0.0 and now > 0.0:
+            self.session_start_time = now
+
         seconds_to_close = float(market.get("secondsToClose", 0.0))
         market_id = str(market.get("id", ""))
         cash_usd = float(account.get("cashUsd", 0.0))
@@ -249,12 +253,12 @@ class ProductionTradingBot:
                     self.consecutive_losses = 0
                 else:
                     self.consecutive_losses += 1
-                    if self.consecutive_losses >= 3:
-                        # Extended cooldown for 15 minutes (900 seconds) on 3 consecutive losses
-                        self.cooldown_until = now + 900.0
-                    else:
-                        # Aftershock cooldown for 10 minutes (600 seconds) on any loss to avoid violent double-whammy
+                    if cash_usd < 6.0 or self.consecutive_losses >= 2:
+                        # 2 market rounds (10 minutes) cooldown when cash is low or sequence risk spikes
                         self.cooldown_until = now + 600.0
+                    else:
+                        # 1 market round (5 minutes) cooldown on single loss
+                        self.cooldown_until = now + 300.0
                 self.last_cash_usd = cash_usd
         else:
             if not self.position_was_open:
@@ -380,10 +384,10 @@ class ProductionTradingBot:
         self.price_history.append((now, btc_mid))
         self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
 
-        # Extreme Volatility Spike Shield: If BTC moved >= $70 in last 60s, shield capital against flash wicks
+        # Extreme Volatility Spike Shield: If BTC moved >= $115 in last 60s, shield capital against flash wicks
         if len(self.price_history) >= 2:
             hist_prices = [p for _, p in self.price_history]
-            if max(hist_prices) - min(hist_prices) >= 70.0:
+            if max(hist_prices) - min(hist_prices) >= 115.0:
                 return {"action": "HOLD"}
 
         # Calculate remaining time in minutes
@@ -393,22 +397,35 @@ class ProductionTradingBot:
         if len(self.price_history) >= 4:
             history_prices = [p for _, p in self.price_history]
             rolling_range = max(history_prices) - min(history_prices)
-            dynamic_sigma = max(25.0, min(120.0, rolling_range * 1.5))
+            dynamic_sigma = max(35.0, min(100.0, rolling_range * 1.2))
         else:
-            dynamic_sigma = BTC_SIGMA_PER_MIN_USD
+            dynamic_sigma = 45.0
 
-        # Dynamic volatility over remaining time: σ * sqrt(τ)
+        # Dynamic Regime Adaptation
+        if dynamic_sigma < 42.0:
+            min_required_gap = 13.0
+        elif dynamic_sigma < 65.0:
+            min_required_gap = 14.0
+        else:
+            min_required_gap = 16.0
+
+        # Two-Tier Closing Sprint Accelerator
+        elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0
+        if elapsed_hours >= 17.5 and cash_usd >= 15.0 and eligible_vol < TARGET_VOLUME_USD:
+            min_required_gap = max(9.5, min_required_gap - 4.5)
+        if elapsed_hours >= 20.0 and cash_usd >= 20.0 and eligible_vol < TARGET_VOLUME_USD:
+            min_required_gap = max(7.5, min_required_gap - 6.5)
+
+        if abs(gap) < min_required_gap:
+            return {"action": "HOLD"}
+
+        # Dynamic volatility over remaining time: sigma * sqrt(tau)
         vol_expected_usd = max(15.0, dynamic_sigma * math.sqrt(tau_min))
 
         # Normalized Z-Score of the BTC price relative to the strike target
         z = gap / vol_expected_usd
         prob_yes = _normal_cdf(z)
         prob_no = 1.0 - prob_yes
-
-        # Minimum required gap to trade: adaptive to volatility regime
-        min_required_gap = max(BASE_MIN_GAP_USD, dynamic_sigma * 0.35 * math.sqrt(tau_min))
-        if abs(gap) < min_required_gap:
-            return {"action": "HOLD"}
 
         # Horizon 1: Micro-Momentum (3 seconds)
         p_3s = [p_h for t_h, p_h in self.price_history if now - t_h >= 3.0]
@@ -438,7 +455,7 @@ class ProductionTradingBot:
             # Trend Direction Alignment:
             # When buying YES, price action must not be in a downward EMA cross or dumping velocity
             if gap > 0:
-                if ema_fast < ema_slow - 5.0 or slope < -0.40:
+                if ema_fast < ema_slow - 7.0 or slope < -0.40:
                     return {"action": "HOLD"}
                 # Overbought Exhaustion Guard: Avoid buying YES into an extreme parabolic top
                 if len(history_prices) >= 8 and _compute_rsi(history_prices) > 92.0:
@@ -446,7 +463,7 @@ class ProductionTradingBot:
 
             # When buying NO, price action must not be in an upward EMA cross or pumping velocity
             if gap < 0:
-                if ema_fast > ema_slow + 5.0 or slope > 0.40:
+                if ema_fast > ema_slow + 7.0 or slope > 0.40:
                     return {"action": "HOLD"}
                 # Oversold Bounce Guard: Avoid buying NO into an extreme capitulation bottom
                 if len(history_prices) >= 8 and _compute_rsi(history_prices) < 8.0:
@@ -512,12 +529,12 @@ class ProductionTradingBot:
 
         # Tiered Anti-Ruin Bankroll Sizing & Loss Throttling:
         # Prevents hitting the 5-share paralysis floor ($3.00) while maximizing growth & volume
-        if self.consecutive_losses >= 2 or cash_usd < 7.0:
+        if self.consecutive_losses >= 2 or cash_usd < 6.0:
             # Tier 1 (Loss Throttling / Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
-            tier_budget = min(2.75, max(2.20, cash_usd * 0.35))
-        elif self.consecutive_losses == 1 or cash_usd < 14.0:
-            # Tier 2 (Cautious Growth): Size ~40% of bankroll up to $3.80
-            tier_budget = min(3.80, cash_usd * 0.40)
+            tier_budget = min(2.50, max(1.80, cash_usd * 0.35))
+        elif cash_usd < 12.0:
+            # Tier 2 (Cautious Growth): Size ~38% of bankroll up to $3.50
+            tier_budget = min(3.50, cash_usd * 0.38)
         else:
             # Tier 3 (Turbo Volume Acceleration): Full capital cushion allows max $4.88 cap
             tier_budget = MAX_BUY_CASH_CEILING
