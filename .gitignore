@@ -5,3 +5,4 @@ __pycache__/
 *.log
 competitors/
 data_2026_cache/
+data_2025_cache/
