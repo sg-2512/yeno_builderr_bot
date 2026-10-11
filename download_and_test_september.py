@@ -127,14 +127,7 @@ def evaluate_single_24h_day(candles_24h: list[dict[str, float]], day_label: str)
         sigma = max(28.0, min(120.0, local_range * 1.2))
 
         # Dynamic Base Regime Gap
-        if sigma < 36.0:
-            min_gap = 10.5
-        elif sigma < 50.0:
-            min_gap = 12.5
-        else:
-            min_gap = 15.0
-
-        # Dynamic Volatility-Scaled Spike Shield
+        min_gap = max(10.5, min(30.0, sigma * 0.22))
         spike_limit = max(115.0, sigma * 2.8)
 
         # Continuous Volume Run-Rate Governor
@@ -151,15 +144,17 @@ def evaluate_single_24h_day(candles_24h: list[dict[str, float]], day_label: str)
             if m >= 264 and vol < 1000.0:                # Hour 22+
                 min_gap = max(1.5, min_gap - 11.0)
 
-        # High-Cash Bankroll Acceleration & Decisive Finisher
-        if cash >= 30.0 and m >= 144 and vol < expected_vol:
-            min_gap = max(3.0, min_gap - 5.0)
-        if cash >= 25.0 and m >= 180 and vol < 850.0:
-            min_gap = max(2.0, min_gap - 8.0)
-        if cash >= 20.0 and m >= 200 and vol < 1000.0:
-            min_gap = max(1.0, min_gap - 14.0)
-        elif cash >= 15.0 and m >= 228 and vol < 1000.0:
-            min_gap = max(1.0, min_gap - 14.0)
+        # High-Cash Early Pacing Acceleration
+        if cash >= 25.0 and m >= 120 and vol < expected_vol: min_gap = max(2.5, min_gap - 6.0)
+        if cash >= 20.0 and m >= 168 and vol < 850.0: min_gap = max(2.0, min_gap - 8.0)
+        if cash >= 15.0 and m >= 192 and vol < 1000.0: min_gap = max(1.0, min_gap - 14.0)
+        elif cash >= 10.5 and m >= 216 and vol < 1000.0: min_gap = max(1.0, min_gap - 14.0)
+
+        # Late-session finish-line ceiling
+        if cash >= 8.0:
+            if m >= 216 and vol < 1000.0: min_gap = min(min_gap, 4.0)
+            if m >= 240 and vol < 1000.0: min_gap = min(min_gap, 2.5)
+            if m >= 264 and vol < 1000.0: min_gap = min(min_gap, 1.0)
 
         hl0 = abs(bars[0]["high"] - bars[0]["low"])
         hl1 = abs(bars[1]["high"] - bars[1]["low"])
@@ -174,7 +169,7 @@ def evaluate_single_24h_day(candles_24h: list[dict[str, float]], day_label: str)
             if len(rolling_history) >= 8:
                 fast_ema = _compute_ema(rolling_history, period=5)
                 slow_ema = _compute_ema(rolling_history, period=15)
-                ema_tol = 18.0 if (cash >= 20.0 and m >= 200) else 7.0
+                ema_tol = 18.0 if (cash >= 15.0 and m >= 192) else 7.0
                 if side == "NO" and fast_ema > slow_ema + ema_tol:
                     continue
                 if side == "YES" and fast_ema < slow_ema - ema_tol:
@@ -187,6 +182,8 @@ def evaluate_single_24h_day(candles_24h: list[dict[str, float]], day_label: str)
                 ask_ceiling = 0.50
             elif cash < 5.5:
                 ask_ceiling = 0.54
+            elif cash < 12.0:
+                ask_ceiling = 0.68
             else:
                 ask_ceiling = 0.82
 
@@ -195,16 +192,20 @@ def evaluate_single_24h_day(candles_24h: list[dict[str, float]], day_label: str)
                 continue
             ask = min(max_affordable_ask, max(0.40, round(p2 + 0.01, 2)))
 
+            fee_est = (0.07 * ask * (1.0 - ask)) + (ask * 0.01)
+
             # Risk-Managed Bankroll Sizing
-            if cash < 5.5:
+            if cash < 12.0:
+                shares = 5
+            elif cash < 5.5:
                 spend = min(2.40, max(1.80, cash * 0.35))
+                shares = math.floor(spend / (ask + fee_est))
             elif cash < 10.0:
                 spend = min(3.40, cash * 0.38)
+                shares = math.floor(spend / (ask + fee_est))
             else:
                 spend = 4.88
-
-            fee_est = (0.07 * ask * (1.0 - ask)) + (ask * 0.01)
-            shares = math.floor(spend / (ask + fee_est))
+                shares = math.floor(spend / (ask + fee_est))
 
             if shares < 5:
                 needed = 5 * (ask + fee_est) + 0.05

@@ -398,13 +398,8 @@ class ProductionTradingBot:
             if max(hist_prices) - min(hist_prices) >= spike_limit:
                 return {"action": "HOLD"}
 
-        # Dynamic Base Regime Gap
-        if dynamic_sigma < 36.0:
-            min_required_gap = 10.5
-        elif dynamic_sigma < 50.0:
-            min_required_gap = 12.5
-        else:
-            min_required_gap = 15.0
+        # Volatility-Scaled Base Regime Gap
+        min_required_gap = max(10.5, min(30.0, dynamic_sigma * 0.22))
 
         # Continuous Volume Run-Rate Governor & High-Cash Finisher
         elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0
@@ -421,15 +416,24 @@ class ProductionTradingBot:
             if elapsed_hours >= 22.0 and eligible_vol < TARGET_VOLUME_USD:
                 min_required_gap = max(1.5, min_required_gap - 11.0)
 
-        # High-Cash Bankroll Acceleration & Decisive Finisher
-        if cash_usd >= 30.0 and elapsed_hours >= 12.0 and eligible_vol < expected_vol:
-            min_required_gap = max(3.0, min_required_gap - 5.0)
-        if cash_usd >= 25.0 and elapsed_hours >= 15.0 and eligible_vol < 850.0:
+        # High-Cash Early Pacing Acceleration
+        if cash_usd >= 25.0 and elapsed_hours >= 10.0 and eligible_vol < expected_vol:
+            min_required_gap = max(2.5, min_required_gap - 6.0)
+        if cash_usd >= 20.0 and elapsed_hours >= 14.0 and eligible_vol < 850.0:
             min_required_gap = max(2.0, min_required_gap - 8.0)
-        if cash_usd >= 20.0 and elapsed_hours >= 16.5 and eligible_vol < TARGET_VOLUME_USD:
+        if cash_usd >= 15.0 and elapsed_hours >= 16.0 and eligible_vol < TARGET_VOLUME_USD:
             min_required_gap = max(1.0, min_required_gap - 14.0)
-        elif cash_usd >= 15.0 and elapsed_hours >= 19.0 and eligible_vol < TARGET_VOLUME_USD:
+        elif cash_usd >= 10.5 and elapsed_hours >= 18.0 and eligible_vol < TARGET_VOLUME_USD:
             min_required_gap = max(1.0, min_required_gap - 14.0)
+
+        # Late-session finish-line ceiling
+        if cash_usd >= 8.0:
+            if elapsed_hours >= 18.0 and eligible_vol < TARGET_VOLUME_USD:
+                min_required_gap = min(min_required_gap, 4.0)
+            if elapsed_hours >= 20.0 and eligible_vol < TARGET_VOLUME_USD:
+                min_required_gap = min(min_required_gap, 2.5)
+            if elapsed_hours >= 22.0 and eligible_vol < TARGET_VOLUME_USD:
+                min_required_gap = min(min_required_gap, 1.0)
 
         if abs(gap) < min_required_gap:
             return {"action": "HOLD"}
@@ -534,7 +538,8 @@ class ProductionTradingBot:
             return {"action": "HOLD"}
 
         # Price Range Filter: Trade where fee convexity and time decay are optimal
-        if not (MIN_ENTRY_PRICE <= best_ask <= MAX_ENTRY_PRICE):
+        effective_max_entry_price = 0.68 if cash_usd < 12.0 else MAX_ENTRY_PRICE
+        if not (MIN_ENTRY_PRICE <= best_ask <= effective_max_entry_price):
             return {"action": "HOLD"}
 
         # ----------------------------------------------------------------------
@@ -545,7 +550,10 @@ class ProductionTradingBot:
 
         # Tiered Anti-Ruin Bankroll Sizing & Loss Throttling:
         # Prevents hitting the 5-share paralysis floor ($3.00) while maximizing growth & volume
-        if self.consecutive_losses >= 2 or cash_usd < 5.5:
+        if cash_usd < 12.0:
+            # Startup Anti-Ruin Protection: Strictly 5 shares during initial $10 startup runway!
+            tier_budget = (min_order_size * (best_ask + 0.05)) + 0.05
+        elif self.consecutive_losses >= 2 or cash_usd < 5.5:
             # Tier 1 (Loss Throttling / Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
             tier_budget = min(2.40, max(1.80, cash_usd * 0.35))
         elif cash_usd < 10.0:
