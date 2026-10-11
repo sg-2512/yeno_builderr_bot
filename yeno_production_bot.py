@@ -136,6 +136,9 @@ class ProductionTradingBot:
         self.price_history: list[tuple[float, float]] = []
         self.exiting: bool = False
         self.position_entered_at: float = -math.inf
+        self.consecutive_losses: int = 0
+        self.cooldown_until: float = -math.inf
+        self.last_cash_usd: float = 10.0
 
     def decide(self, observation: dict[str, Any]) -> dict[str, Any]:
         """Entry point for /decide. Thread-safe with latched emergency exit on error."""
@@ -197,9 +200,19 @@ class ProductionTradingBot:
             if self.position_was_open:
                 self.completed_cycles += 1
                 self.last_flat_at = now
+                # Track PnL to govern consecutive loss throttling
+                if cash_usd > self.last_cash_usd + 1e-4:
+                    self.consecutive_losses = 0
+                else:
+                    self.consecutive_losses += 1
+                    if self.consecutive_losses >= 3:
+                        # Cool down for 15 minutes (900 seconds) to bypass violent whipsaw regimes
+                        self.cooldown_until = now + 900.0
+                self.last_cash_usd = cash_usd
         else:
             if not self.position_was_open:
                 self.position_entered_at = now
+                self.last_cash_usd = cash_usd
         self.position_was_open = position is not None
 
         # ----------------------------------------------------------------------
@@ -284,6 +297,10 @@ class ProductionTradingBot:
         if not (ENTRY_MIN_SECONDS_TO_CLOSE < seconds_to_close <= ENTRY_MAX_SECONDS_TO_CLOSE):
             return {"action": "HOLD"}
 
+        # Circuit Breaker: Enforce cooldown if triggered by 3 consecutive losses
+        if now < self.cooldown_until:
+            return {"action": "HOLD"}
+
         if self.completed_cycles >= MAX_CYCLES_PER_MARKET:
             return {"action": "HOLD"}
 
@@ -315,6 +332,12 @@ class ProductionTradingBot:
         # Track BTC price history for real-time volatility & multi-horizon momentum
         self.price_history.append((now, btc_mid))
         self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
+
+        # Extreme Volatility Spike Shield: If BTC moved >= $85 in last 60s, shield capital against flash wicks
+        if len(self.price_history) >= 2:
+            hist_prices = [p for _, p in self.price_history]
+            if max(hist_prices) - min(hist_prices) >= 85.0:
+                return {"action": "HOLD"}
 
         # Calculate remaining time in minutes
         tau_min = max(0.5, seconds_to_close / 60.0)
@@ -416,14 +439,14 @@ class ProductionTradingBot:
         rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
         available_cash_limit = max(0.0, cash_usd - 0.15)
 
-        # Tiered Anti-Ruin Bankroll Sizing:
+        # Tiered Anti-Ruin Bankroll Sizing & Loss Throttling:
         # Prevents hitting the 5-share paralysis floor ($3.00) while maximizing growth & volume
-        if cash_usd < 7.0:
-            # Tier 1 (Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
-            tier_budget = min(2.75, max(2.20, cash_usd * 0.40))
-        elif cash_usd < 14.0:
-            # Tier 2 (Conservative Growth): Size ~45% of bankroll up to $4.20
-            tier_budget = min(4.20, cash_usd * 0.45)
+        if self.consecutive_losses >= 2 or cash_usd < 7.0:
+            # Tier 1 (Loss Throttling / Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
+            tier_budget = min(2.75, max(2.20, cash_usd * 0.35))
+        elif self.consecutive_losses == 1 or cash_usd < 14.0:
+            # Tier 2 (Cautious Growth): Size ~40% of bankroll up to $3.80
+            tier_budget = min(3.80, cash_usd * 0.40)
         else:
             # Tier 3 (Turbo Volume Acceleration): Full capital cushion allows max $4.88 cap
             tier_budget = MAX_BUY_CASH_CEILING

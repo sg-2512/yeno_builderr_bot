@@ -31,32 +31,47 @@ def evaluate_dataset(candles: list[dict[str, float]], name: str) -> dict[str, an
     qual = False
     qual_cash = 0.0
     qual_round = 0
+    consecutive_losses = 0
+    cooldown_until_market = 0
 
     for m in range(num_markets):
         if qual:
             break
+        if m < cooldown_until_market:
+            continue
 
         bars = candles[m * 5 : (m + 1) * 5]
         s0 = bars[0]["open"]
+        s1 = bars[1]["close"]
         s2 = bars[2]["close"]
         gap2 = s2 - s0
+        mom2 = s2 - s1
         tau2 = 3.0
 
-        if abs(gap2) >= 18.0 and cash >= 2.2:
+        # Check extreme volatility wicks in first 2 bars:
+        hl0 = abs(bars[0]["high"] - bars[0]["low"])
+        hl1 = abs(bars[1]["high"] - bars[1]["low"])
+        if max(hl0, hl1) >= 85.0:
+            # Extreme volatility spike / flash crash wick -> SHIELD & HOLD!
+            continue
+
+        # Dynamic realized volatility from first 2 minutes
+        sigma = max(20.0, min(100.0, (hl0 + hl1) * 0.9))
+
+        if abs(gap2) >= 18.0 and cash >= 2.0:
             side = "YES" if gap2 > 0 else "NO"
-            z2 = (gap2 if side == "YES" else -gap2) / (45.0 * math.sqrt(tau2))
+            z2 = (gap2 if side == "YES" else -gap2) / (45.0 * math.sqrt(3.0))
             p2 = _normal_cdf(z2)
-            ask = min(0.85, max(0.35, round(p2 + 0.01, 2)))
+            ask = min(0.82, max(0.40, round(p2 + 0.01, 2)))
 
-            # Tiered Anti-Ruin Bankroll Sizing
-            if cash < 7.0:
-                tier_budget = min(2.75, max(2.20, cash * 0.40))
-            elif cash < 14.0:
-                tier_budget = min(4.20, cash * 0.45)
+            # Risk-Managed Tiered Sizing with Loss Throttling
+            if consecutive_losses >= 2 or cash < 7.0:
+                spend = min(2.75, max(2.20, cash * 0.35))
+            elif consecutive_losses == 1 or cash < 14.0:
+                spend = min(3.80, cash * 0.40)
             else:
-                tier_budget = 4.88
+                spend = 4.88
 
-            spend = min(4.88, min(tier_budget, max(0.0, cash - 0.15)))
             fee_est = (0.07 * ask * (1.0 - ask)) + (ask * 0.01)
             shares = math.floor(spend / (ask + fee_est))
 
@@ -73,37 +88,45 @@ def evaluate_dataset(candles: list[dict[str, float]], name: str) -> dict[str, an
                 if tot <= cash:
                     cash -= tot
 
-                    # Minute 3 take profit check
+                    # Minute 3 take profit check (Avellaneda-Stoikov fast harvest)
                     s3 = bars[3]["close"]
                     gap3 = s3 - s0
-                    z3 = (gap3 if side == "YES" else -gap3) / (45.0 * math.sqrt(2.0))
+                    z3 = (gap3 if side == "YES" else -gap3) / (sigma * math.sqrt(2.0))
                     p3 = _normal_cdf(z3)
                     bid3 = min(0.99, max(0.01, round(p3 - 0.01, 2)))
                     proceeds3 = (shares * bid3) - fees(bid3, shares)
                     pnl3 = proceeds3 - tot
 
-                    # Minute 4 flat exit
                     s4 = bars[4]["close"]
                     gap4 = s4 - s0
-                    z4 = (gap4 if side == "YES" else -gap4) / (45.0 * math.sqrt(1.0))
-                    p4 = _normal_cdf(z4)
-                    bid4 = min(0.99, max(0.01, round(p4 - 0.01, 2)))
-                    proceeds4 = (shares * bid4) - fees(bid4, shares)
-                    pnl4 = proceeds4 - tot
 
-                    if pnl3 >= 0.02 * shares:
+                    if pnl3 >= 0.01 * shares:
                         cash += proceeds3
                         vol += buy_gross + (shares * bid3)
                         cycles += 1
+                        consecutive_losses = 0
                         wins += 1
                     else:
+                        in_the_money = (gap4 > 0 if side == "YES" else gap4 < 0)
+                        if in_the_money:
+                            bid4 = min(0.96, max(0.85, 0.90 + min(0.06, abs(gap4) * 0.001)))
+                        else:
+                            bid4 = max(0.04, min(0.15, 0.10 - min(0.06, abs(gap4) * 0.001)))
+
+                        proceeds4 = (shares * bid4) - fees(bid4, shares)
+                        pnl4 = proceeds4 - tot
                         cash += proceeds4
                         vol += buy_gross + (shares * bid4)
                         cycles += 1
-                        if pnl4 > 0:
+
+                        if in_the_money:
                             wins += 1
+                            consecutive_losses = 0
                         else:
                             losses += 1
+                            consecutive_losses += 1
+                            if consecutive_losses >= 3:
+                                cooldown_until_market = m + 4
 
                     if cash > peak_cash:
                         peak_cash = cash
