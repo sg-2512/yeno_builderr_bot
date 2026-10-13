@@ -41,7 +41,7 @@ FORCED_EXIT_SECONDS = 45.0             # Standard exit threshold before expiry d
 EMERGENCY_EXIT_SECONDS = 25.0          # Hard emergency exit: sweep bids before 15s freeze
 REENTRY_COOLDOWN_SECONDS = 2.0         # Wait between trades to avoid whipsaw entries
 MAX_REFERENCE_AGE_SECONDS = 1.5        # Max allowable staleness of BTC reference data
-STOP_LOSS_PER_SHARE_USD = 0.07         # Disciplined loss limit per share
+STOP_LOSS_PER_SHARE_USD = 0.10         # Disciplined loss limit per share (accommodates 3c spread friction)
 TAKE_PROFIT_PER_SHARE_USD = 0.025      # Lock in net profit (+2.5 cents/share after all fees)
 
 
@@ -214,12 +214,12 @@ class ProductionTradingBot:
         elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0.0 else 0.0
         expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
 
-        # Continuously record BTC mid price into rolling 60s history on EVERY tick (even while holding positions)
+        # Continuously record BTC mid price into rolling 180s history on EVERY tick (even while holding positions)
         if isinstance(reference, dict) and "btcMidUsd" in reference:
             try:
                 btc_mid_val = float(reference["btcMidUsd"])
                 self.price_history.append((now, btc_mid_val))
-                self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
+                self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 180.0][-60:]
             except (ValueError, TypeError):
                 pass
 
@@ -249,8 +249,8 @@ class ProductionTradingBot:
             self.completed_cycles = 0
             self.last_flat_at = -math.inf
             self.last_buy_attempt_at = -math.inf
-            # Preserve recent 60s price history across markets so momentum/EMA filters aren't skipped on tick 1
-            self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
+            # Preserve recent 180s price history across markets so momentum/EMA filters aren't skipped on tick 1
+            self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 180.0][-60:]
             self.exiting = False
             self.position_entered_at = -math.inf
 
@@ -309,7 +309,9 @@ class ProductionTradingBot:
             # Learning 3 (RowletCC): Reverse Signal Cut — dump immediately if BTC gap flips violently
             if isinstance(reference, dict) and not bool(reference.get("targetProvisional", True)):
                 cur_gap = float(reference.get("btcMidUsd", 0)) - float(reference.get("openingTargetUsd", 0))
-                if (side == "YES" and cur_gap < -BASE_MIN_GAP_USD) or (side == "NO" and cur_gap > BASE_MIN_GAP_USD):
+                p_scale_exit = max(0.035, min(1.5, float(reference.get("btcMidUsd", 80000.0)) / 80000.0))
+                scaled_rev_gap = BASE_MIN_GAP_USD * p_scale_exit
+                if (side == "YES" and cur_gap < -scaled_rev_gap) or (side == "NO" and cur_gap > scaled_rev_gap):
                     self.exiting = True
                     return {"action": "SELL"}
 
@@ -534,9 +536,11 @@ class ProductionTradingBot:
         if p_micro < p_mid - 0.008:
             return {"action": "HOLD"}
 
-        # Entry Price Window: 0.50 to 0.92 captures high-conviction trends from early breakout through mature favorites
+        # Bankroll-Tiered Entry Price Ceiling: Prevent buying expensive 0.85-0.92 options when bankroll is small ($10)
+        # to avoid asymmetric ruin risk from sharp reversals
+        effective_max_ask = 0.75 if cash_usd < 14.0 else (0.82 if cash_usd < 25.0 else MAX_ENTRY_PRICE)
         MIN_ENTRY_PRICE = 0.50
-        if not (MIN_ENTRY_PRICE <= best_ask <= MAX_ENTRY_PRICE):
+        if not (MIN_ENTRY_PRICE <= best_ask <= effective_max_ask):
             return {"action": "HOLD"}
 
         # Model Directional & Valuation Validation:

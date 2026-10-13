@@ -18,8 +18,8 @@ def run_tests() -> None:
     print("=" * 65)
 
     base_obs = json.load(open("yeno-sample-observation.json"))
-    base_obs["books"]["YES"] = {"asks": [[0.80, 100]], "bids": [[0.79, 100]], "minOrderSize": 5}
-    base_obs["books"]["NO"] = {"asks": [[0.21, 100]], "bids": [[0.20, 100]], "minOrderSize": 5}
+    base_obs["books"]["YES"] = {"asks": [[0.70, 100]], "bids": [[0.69, 100]], "minOrderSize": 5}
+    base_obs["books"]["NO"] = {"asks": [[0.31, 100]], "bids": [[0.30, 100]], "minOrderSize": 5}
 
     # Test 1: Fresh start -> BUY on positive trend
     bot = ProductionTradingBot()
@@ -34,8 +34,8 @@ def run_tests() -> None:
     bot2 = ProductionTradingBot()
     obs_no = copy.deepcopy(base_obs)
     obs_no["reference"]["btcMidUsd"] = 80350.0  # Gap is -74.9 USD
-    obs_no["books"]["NO"] = {"asks": [[0.80, 100]], "bids": [[0.79, 100]], "minOrderSize": 5}
-    obs_no["books"]["YES"] = {"asks": [[0.21, 100]], "bids": [[0.20, 100]], "minOrderSize": 5}
+    obs_no["books"]["NO"] = {"asks": [[0.70, 100]], "bids": [[0.69, 100]], "minOrderSize": 5}
+    obs_no["books"]["YES"] = {"asks": [[0.31, 100]], "bids": [[0.30, 100]], "minOrderSize": 5}
     d2 = bot2.decide(obs_no)
     print(f"\n[TEST 2] Negative Gap (BTC dropped): {d2}")
     assert d2["action"] == "BUY", f"Expected BUY, got {d2}"
@@ -180,6 +180,43 @@ def run_tests() -> None:
     print(f"\n[TEST 13] Flash Spike Shield Trigger: {d13}")
     assert d13["action"] == "HOLD", f"Expected HOLD on flash wick spike, got {d13}"
     print("  -> PASSED: Successfully shielded against extreme flash crash / spike wick!")
+
+    # Test 14: Bankroll-Tiered Entry Price Ceiling
+    bot14 = ProductionTradingBot()
+    obs_t1 = copy.deepcopy(base_obs)
+    obs_t1["account"]["cashUsd"] = 10.00  # Tier 1: max ask 0.75
+    obs_t1["books"]["YES"]["asks"] = [[0.80, 100]]
+    obs_t1["books"]["YES"]["bids"] = [[0.79, 100]]
+    d14_t1 = bot14.decide(obs_t1)
+    print(f"\n[TEST 14] Tier 1 ($10 cash) 0.80 Ask Rejection: {d14_t1}")
+    assert d14_t1["action"] == "HOLD", f"Expected HOLD on 0.80 ask when cash < $14, got {d14_t1}"
+    
+    obs_t2 = copy.deepcopy(obs_t1)
+    obs_t2["account"]["cashUsd"] = 16.00  # Tier 2: max ask 0.82
+    d14_t2 = bot14.decide(obs_t2)
+    print(f"  -> Tier 2 ($16 cash) 0.80 Ask Acceptance: {d14_t2}")
+    assert d14_t2["action"] == "BUY", f"Expected BUY on 0.80 ask when cash >= $14, got {d14_t2}"
+    print("  -> PASSED: Bankroll-Tiered Entry Ceiling protects small bankroll and expands with profit!")
+
+    # Test 15: Stop-Loss vs Spread Friction (STOP_LOSS = 0.10)
+    bot15 = ProductionTradingBot()
+    obs_friction = copy.deepcopy(base_obs)
+    obs_friction["account"]["position"] = {
+        "market_id": "sample-btc-5m-market",
+        "outcome": "YES",
+        "shares": 5.0,
+        "buy_gross_usd": 3.50,   # Bought 5 shares at 0.70
+        "buy_fees_usd": 0.08,
+        "sell_gross_usd": 0.0,
+        "sell_fees_usd": 0.0,
+    }
+    # Market bid is 0.67 (spread was 3c: 0.70 ask, 0.67 bid; pnl is -$0.23 total, or -$0.046/share)
+    obs_friction["books"]["YES"]["bids"] = [[0.67, 100]]
+    obs_friction["market"]["secondsToClose"] = 200.0
+    d15 = bot15.decide(obs_friction)
+    print(f"\n[TEST 15] 3-Cent Spread Friction Stop-Loss Check: {d15}")
+    assert d15["action"] == "HOLD", f"Expected HOLD on normal 3c spread friction, got {d15}"
+    print("  -> PASSED: STOP_LOSS_PER_SHARE_USD = 0.10 accommodates spread friction without premature dump!")
 
     print("\n" + "=" * 65)
     print("ALL LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
