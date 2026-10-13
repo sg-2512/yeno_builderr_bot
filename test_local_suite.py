@@ -18,6 +18,8 @@ def run_tests() -> None:
     print("=" * 65)
 
     base_obs = json.load(open("yeno-sample-observation.json"))
+    base_obs["books"]["YES"] = {"asks": [[0.80, 100]], "bids": [[0.79, 100]], "minOrderSize": 5}
+    base_obs["books"]["NO"] = {"asks": [[0.21, 100]], "bids": [[0.20, 100]], "minOrderSize": 5}
 
     # Test 1: Fresh start -> BUY on positive trend
     bot = ProductionTradingBot()
@@ -32,6 +34,8 @@ def run_tests() -> None:
     bot2 = ProductionTradingBot()
     obs_no = copy.deepcopy(base_obs)
     obs_no["reference"]["btcMidUsd"] = 80350.0  # Gap is -74.9 USD
+    obs_no["books"]["NO"] = {"asks": [[0.80, 100]], "bids": [[0.79, 100]], "minOrderSize": 5}
+    obs_no["books"]["YES"] = {"asks": [[0.21, 100]], "bids": [[0.20, 100]], "minOrderSize": 5}
     d2 = bot2.decide(obs_no)
     print(f"\n[TEST 2] Negative Gap (BTC dropped): {d2}")
     assert d2["action"] == "BUY", f"Expected BUY, got {d2}"

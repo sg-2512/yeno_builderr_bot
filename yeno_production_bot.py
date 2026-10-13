@@ -29,20 +29,20 @@ MAX_HOLD_SECONDS = 90.0                # Max hold time to allow theta decay & tr
 CASH_UTILIZATION_RATIO = 0.95          # Max fraction of available cash to risk per BUY
 TARGET_VOLUME_USD = 1000.0             # Official volume qualification target
 MAX_SPREAD_USD = 0.03                  # Strict spread filter (reject wide spreads)
-MAX_ENTRY_PRICE = 0.85                 # High-conviction ceiling: capture strong trends
-MIN_ENTRY_PRICE = 0.35                 # Avoid low probability lotteries
-BASE_MIN_GAP_USD = 18.0                # Real-data calibrated strike gap threshold
+MAX_ENTRY_PRICE = 0.92                 # High-conviction ceiling: capture strong trends
+MIN_ENTRY_PRICE = 0.48                 # Avoid low probability lotteries below 0.48; covers favorites up to 0.92
+BASE_MIN_GAP_USD = 12.0                # Real-data calibrated strike gap threshold
 BTC_SIGMA_PER_MIN_USD = 45.0           # Calibrated BTC 1-minute volatility
-MIN_EDGE_MARGIN = 0.015                # Required mathematical probability edge above fees
-MAX_CYCLES_PER_MARKET = 1              # Focus on 1 high-conviction trade per 5m round to eliminate churning
-ENTRY_MAX_SECONDS_TO_CLOSE = 210.0     # Scan for entries once trend establishes (t <= 3.5 min)
-ENTRY_MIN_SECONDS_TO_CLOSE = 65.0      # Cut off entries with <= 65s left to guarantee exit runway
-FORCED_EXIT_SECONDS = 55.0             # Standard exit threshold before expiry decay
+MIN_EDGE_MARGIN = 0.010                # Required mathematical probability edge above fees
+MAX_CYCLES_PER_MARKET = 3              # Allow up to 3 trades per 5m market when opportunities appear
+ENTRY_MAX_SECONDS_TO_CLOSE = 240.0     # Scan for entries once trend establishes (t <= 4 min)
+ENTRY_MIN_SECONDS_TO_CLOSE = 60.0      # Cut off entries with <= 60s left to guarantee exit runway
+FORCED_EXIT_SECONDS = 45.0             # Standard exit threshold before expiry decay
 EMERGENCY_EXIT_SECONDS = 25.0          # Hard emergency exit: sweep bids before 15s freeze
 REENTRY_COOLDOWN_SECONDS = 2.0         # Wait between trades to avoid whipsaw entries
 MAX_REFERENCE_AGE_SECONDS = 1.5        # Max allowable staleness of BTC reference data
-STOP_LOSS_PER_SHARE_USD = 0.10         # Controlled loss limit per share
-TAKE_PROFIT_PER_SHARE_USD = 0.02       # Lock in net profit (+2 cents/share after all fees)
+STOP_LOSS_PER_SHARE_USD = 0.07         # Disciplined loss limit per share
+TAKE_PROFIT_PER_SHARE_USD = 0.025      # Lock in net profit (+2.5 cents/share after all fees)
 
 
 def _normal_cdf(z: float) -> float:
@@ -182,7 +182,7 @@ class ProductionTradingBot:
         self.position_entered_at: float = -math.inf
         self.consecutive_losses: int = 0
         self.cooldown_until: float = -math.inf
-        self.last_cash_usd: float = 10.0
+        self.pre_trade_cash_usd: float = 10.0
         self.session_start_time: float = -math.inf
 
     def decide(self, observation: dict[str, Any]) -> dict[str, Any]:
@@ -237,29 +237,38 @@ class ProductionTradingBot:
             self.completed_cycles = 0
             self.last_flat_at = -math.inf
             self.last_buy_attempt_at = -math.inf
-            self.price_history = []
+            # Preserve recent 60s price history across markets so momentum/EMA filters aren't skipped on tick 1
+            self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
             self.exiting = False
             self.position_entered_at = -math.inf
 
-        # Cycle transition tracking
+        # Cycle transition tracking with accurate pre-trade cash accounting
         if position is None:
             self.exiting = False
             self.position_entered_at = -math.inf
             if self.position_was_open:
                 self.completed_cycles += 1
                 self.last_flat_at = now
-                # Track PnL to govern consecutive loss throttling
-                if cash_usd > self.last_cash_usd + 1e-4:
+                # Accurate cycle PnL: compare cash now with cash balance BEFORE trade was entered
+                cycle_pnl = cash_usd - self.pre_trade_cash_usd
+                if cycle_pnl > 1e-4:
                     self.consecutive_losses = 0
-                else:
+                    self.cooldown_until = -math.inf
+                elif cycle_pnl < -1e-4:
                     self.consecutive_losses += 1
-                    # Cooldown on loss: 10 minutes (2 rounds) to prevent whipsaw clustering
-                    self.cooldown_until = now + 600.0
-                self.last_cash_usd = cash_usd
+                    # Cooldown on 2 consecutive losses: 10 minutes to prevent whipsaw clustering
+                    if self.consecutive_losses >= 2:
+                        self.cooldown_until = now + 600.0
+                self.pre_trade_cash_usd = cash_usd
+            else:
+                self.pre_trade_cash_usd = cash_usd
         else:
             if not self.position_was_open:
                 self.position_entered_at = now
-                self.last_cash_usd = cash_usd
+                # If entering position, ensure pre_trade_cash reflects pre-buy cash (cash + buy cost)
+                pos_cost = float(position.get("buy_gross_usd", 0.0)) + float(position.get("buy_fees_usd", 0.0))
+                if pos_cost > 0:
+                    self.pre_trade_cash_usd = cash_usd + pos_cost
         self.position_was_open = position is not None
 
         # ----------------------------------------------------------------------
@@ -401,43 +410,8 @@ class ProductionTradingBot:
             if max(hist_prices) - min(hist_prices) >= spike_limit:
                 return {"action": "HOLD"}
 
-        # Volatility-Scaled Base Regime Gap
-        min_required_gap = max(10.5 * p_scale, min(30.0 * p_scale, dynamic_sigma * 0.22))
-
-        # Continuous Volume Run-Rate Governor & High-Cash Finisher
-        elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0
-        expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
-        if cash_usd >= 10.5:
-            if elapsed_hours >= 6.0 and eligible_vol < expected_vol:
-                min_required_gap = max(7.5, min_required_gap - 3.0)
-            if elapsed_hours >= 12.0 and eligible_vol < expected_vol:
-                min_required_gap = max(6.0, min_required_gap - 5.0)
-            if elapsed_hours >= 16.0 and eligible_vol < TARGET_VOLUME_USD:
-                min_required_gap = max(4.5, min_required_gap - 7.0)
-            if elapsed_hours >= 20.0 and eligible_vol < TARGET_VOLUME_USD:
-                min_required_gap = max(3.0, min_required_gap - 9.0)
-            if elapsed_hours >= 22.0 and eligible_vol < TARGET_VOLUME_USD:
-                min_required_gap = max(1.5, min_required_gap - 11.0)
-
-        # High-Cash Early Pacing Acceleration
-        if cash_usd >= 25.0 and elapsed_hours >= 10.0 and eligible_vol < expected_vol:
-            min_required_gap = max(2.5, min_required_gap - 6.0)
-        if cash_usd >= 20.0 and elapsed_hours >= 14.0 and eligible_vol < 850.0:
-            min_required_gap = max(2.0, min_required_gap - 8.0)
-        if cash_usd >= 15.0 and elapsed_hours >= 16.0 and eligible_vol < TARGET_VOLUME_USD:
-            min_required_gap = max(1.0, min_required_gap - 14.0)
-        elif cash_usd >= 10.5 and elapsed_hours >= 18.0 and eligible_vol < TARGET_VOLUME_USD:
-            min_required_gap = max(1.0, min_required_gap - 14.0)
-
-        # Late-session finish-line ceiling
-        if cash_usd >= 8.0:
-            if elapsed_hours >= 18.0 and eligible_vol < TARGET_VOLUME_USD:
-                min_required_gap = min(min_required_gap, 4.0)
-            if elapsed_hours >= 20.0 and eligible_vol < TARGET_VOLUME_USD:
-                min_required_gap = min(min_required_gap, 2.5)
-            if elapsed_hours >= 22.0 and eligible_vol < TARGET_VOLUME_USD:
-                min_required_gap = min(min_required_gap, 1.0)
-
+        # Volatility-Scaled Base Regime Gap (Disciplined: never degenerates into noise gambling)
+        min_required_gap = max(12.0 * p_scale, min(28.0 * p_scale, dynamic_sigma * 0.22))
         if abs(gap) < min_required_gap:
             return {"action": "HOLD"}
 
@@ -550,9 +524,28 @@ class ProductionTradingBot:
         if p_micro < p_mid - 0.008:
             return {"action": "HOLD"}
 
-        # Price Range Filter: Trade where fee convexity and time decay are optimal (0.54 startup cap for 1:1 convexity)
-        effective_max_entry_price = 0.54 if cash_usd < 12.0 else MAX_ENTRY_PRICE
-        if not (MIN_ENTRY_PRICE <= best_ask <= effective_max_entry_price):
+        # Adaptive Favorite Floor: Focus on high-probability favorites (0.68 to 0.92) to cut taker fees in half
+        # When bankroll expands (cash >= $15) or pacing requires volume, expand down to 0.60
+        elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0
+        expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
+        if cash_usd >= 20.0 and (eligible_vol < expected_vol or elapsed_hours >= 12.0):
+            min_fav = 0.60
+        elif cash_usd >= 12.0:
+            min_fav = 0.64
+        else:
+            min_fav = 0.68
+
+        if not (min_fav <= best_ask <= MAX_ENTRY_PRICE):
+            return {"action": "HOLD"}
+
+        # Model Edge Verification: Compare model win probability against all-in acquisition cost
+        target_prob = prob_yes if side == "YES" else prob_no
+        fee_est = (0.07 * best_ask * (1.0 - best_ask)) + (0.01 * best_ask)
+        breakeven_prob = best_ask + fee_est
+        edge = target_prob - breakeven_prob
+
+        # Reject if model probability does not justify the price
+        if edge < -0.01:
             return {"action": "HOLD"}
 
         # ----------------------------------------------------------------------
@@ -560,29 +553,19 @@ class ProductionTradingBot:
         # ----------------------------------------------------------------------
         rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
         available_cash_limit = max(0.0, cash_usd - 0.15)
+        min_5_cost = (min_order_size * (best_ask + 0.02)) + 0.08
 
-        # Tiered Anti-Ruin Bankroll Sizing & Loss Throttling:
-        # Prevents hitting the 5-share paralysis floor ($3.00) while maximizing growth & volume
-        if cash_usd < 12.0:
-            # Startup Anti-Ruin Protection: Strictly 5 shares during initial $10 startup runway!
-            tier_budget = (min_order_size * (best_ask + 0.05)) + 0.05
-        elif self.consecutive_losses >= 2 or cash_usd < 5.5:
-            # Tier 1 (Loss Throttling / Emergency Preservation): Size strictly for minOrderSize (5-6 shares)
-            tier_budget = min(2.40, max(1.80, cash_usd * 0.35))
-        elif cash_usd < 10.0:
-            # Tier 2 (Cautious Growth): Size ~38% of bankroll up to $3.40
-            tier_budget = min(3.40, cash_usd * 0.38)
+        if cash_usd < min_5_cost:
+            return {"action": "HOLD"}
+
+        if cash_usd < 12.0 or self.consecutive_losses >= 1:
+            tier_budget = min_5_cost
+        elif cash_usd < 20.0:
+            tier_budget = min(4.88, max(min_5_cost, cash_usd * 0.40))
         else:
-            # Tier 3 (Turbo Volume Acceleration): Full capital cushion allows max $4.88 cap
             tier_budget = MAX_BUY_CASH_CEILING
 
         max_spend_budget = min(rule_max_buy, MAX_BUY_CASH_CEILING, tier_budget, available_cash_limit)
-
-        # Target Finish Sizing Governor: If approaching $1,000, size only what's needed
-        remaining_vol_to_qualify = TARGET_VOLUME_USD - eligible_vol
-        if remaining_vol_to_qualify < 20.0:
-            needed_buy = max(2.5, (remaining_vol_to_qualify / 2.0) + 0.1)
-            max_spend_budget = min(max_spend_budget, needed_buy)
 
         if max_spend_budget < 1.0:
             return {"action": "HOLD"}
@@ -623,6 +606,7 @@ class ProductionTradingBot:
         funded_cash = min(max_spend_budget, optimal_cash + headroom)
 
         self.last_buy_attempt_at = now
+        self.pre_trade_cash_usd = cash_usd
         return {
             "action": "BUY",
             "outcome": side,
