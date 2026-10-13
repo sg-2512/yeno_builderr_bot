@@ -211,6 +211,18 @@ class ProductionTradingBot:
         if self.session_start_time <= 0.0 and now > 0.0:
             self.session_start_time = now
 
+        elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0.0 else 0.0
+        expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
+
+        # Continuously record BTC mid price into rolling 60s history on EVERY tick (even while holding positions)
+        if isinstance(reference, dict) and "btcMidUsd" in reference:
+            try:
+                btc_mid_val = float(reference["btcMidUsd"])
+                self.price_history.append((now, btc_mid_val))
+                self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
+            except (ValueError, TypeError):
+                pass
+
         seconds_to_close = float(market.get("secondsToClose", 0.0))
         market_id = str(market.get("id", ""))
         cash_usd = float(account.get("cashUsd", 0.0))
@@ -385,10 +397,6 @@ class ProductionTradingBot:
         target_usd = float(reference["openingTargetUsd"])
         gap = btc_mid - target_usd
 
-        # Track BTC price history for real-time volatility & multi-horizon momentum
-        self.price_history.append((now, btc_mid))
-        self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 60.0]
-
         # Calculate remaining time in minutes
         tau_min = max(0.5, seconds_to_close / 60.0)
 
@@ -398,13 +406,15 @@ class ProductionTradingBot:
         # Real-Time Volatility Adaptation: estimate realized volatility from rolling price history
         if len(self.price_history) >= 4:
             history_prices = [p for _, p in self.price_history]
-            rolling_range = max(history_prices) - min(history_prices)
-            dynamic_sigma = max(28.0 * p_scale, min(180.0 * p_scale, rolling_range * 1.2))
+            mean_p = sum(history_prices) / len(history_prices)
+            var_p = sum((p - mean_p) ** 2 for p in history_prices) / len(history_prices)
+            realized_std = math.sqrt(max(0.0, var_p))
+            dynamic_sigma = max(28.0 * p_scale, min(120.0 * p_scale, realized_std * 2.5))
         else:
             dynamic_sigma = 45.0 * p_scale
 
         # Dynamic Volatility-Scaled Spike Shield: Reject black swan flash wicks without discarding normal volatility
-        spike_limit = max(140.0 * p_scale, dynamic_sigma * 4.0)
+        spike_limit = max(120.0 * p_scale, min(250.0 * p_scale, dynamic_sigma * 2.5))
         if len(self.price_history) >= 2:
             hist_prices = [p for _, p in self.price_history]
             if max(hist_prices) - min(hist_prices) >= spike_limit:
@@ -524,28 +534,24 @@ class ProductionTradingBot:
         if p_micro < p_mid - 0.008:
             return {"action": "HOLD"}
 
-        # Adaptive Favorite Floor: Focus on high-probability favorites (0.68 to 0.92) to cut taker fees in half
-        # When bankroll expands (cash >= $15) or pacing requires volume, expand down to 0.60
-        elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0 else 0.0
-        expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
-        if cash_usd >= 20.0 and (eligible_vol < expected_vol or elapsed_hours >= 12.0):
-            min_fav = 0.60
-        elif cash_usd >= 12.0:
-            min_fav = 0.64
-        else:
-            min_fav = 0.68
-
-        if not (min_fav <= best_ask <= MAX_ENTRY_PRICE):
+        # Entry Price Window: 0.50 to 0.92 captures high-conviction trends from early breakout through mature favorites
+        MIN_ENTRY_PRICE = 0.50
+        if not (MIN_ENTRY_PRICE <= best_ask <= MAX_ENTRY_PRICE):
             return {"action": "HOLD"}
 
-        # Model Edge Verification: Compare model win probability against all-in acquisition cost
+        # Model Directional & Valuation Validation:
+        # 1. Require directional conviction from the quant engine
         target_prob = prob_yes if side == "YES" else prob_no
+        if target_prob < 0.52:
+            return {"action": "HOLD"}
+
+        # 2. Prevent buying overpriced asks where market maker markup exceeds fair spread + fees
+        # Normal taker friction (half-spread + protocol/platform fees) is -0.020 to -0.045.
+        # Reject if edge is worse than -0.050 (meaning the ask is unacceptably marked up).
         fee_est = (0.07 * best_ask * (1.0 - best_ask)) + (0.01 * best_ask)
         breakeven_prob = best_ask + fee_est
         edge = target_prob - breakeven_prob
-
-        # Reject if model probability does not justify the price
-        if edge < -0.01:
+        if edge < -0.050:
             return {"action": "HOLD"}
 
         # ----------------------------------------------------------------------
