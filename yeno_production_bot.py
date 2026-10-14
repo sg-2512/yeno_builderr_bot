@@ -423,7 +423,12 @@ class ProductionTradingBot:
                 return {"action": "HOLD"}
 
         # Volatility-Scaled Base Regime Gap (Disciplined: never degenerates into noise gambling)
-        min_required_gap = max(12.0 * p_scale, min(28.0 * p_scale, dynamic_sigma * 0.22))
+        # Late-Session Finish Push: If healthy cash (>= $8.0) and <= $50 vol needed after 21h, safely lower gap floor
+        if cash_usd >= 8.0 and (TARGET_VOLUME_USD - eligible_vol <= 50.0) and elapsed_hours >= 21.0:
+            min_required_gap = max(8.0 * p_scale, min(24.0 * p_scale, dynamic_sigma * 0.16))
+        else:
+            min_required_gap = max(12.0 * p_scale, min(28.0 * p_scale, dynamic_sigma * 0.22))
+
         if abs(gap) < min_required_gap:
             return {"action": "HOLD"}
 
@@ -563,12 +568,28 @@ class ProductionTradingBot:
         # ----------------------------------------------------------------------
         rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
         available_cash_limit = max(0.0, cash_usd - 0.15)
-        min_5_cost = (min_order_size * (best_ask + 0.02)) + 0.08
+        # Exact-cost 5-share sizing floor via order book depth simulation (avoids premature lockout at $2.50-$2.68 cash)
+        est_5 = _estimate_buy(asks, min_order_size)
+        if est_5 is None:
+            return {"action": "HOLD"}
+        gross_5, fees_5 = est_5
+        min_5_cost = gross_5 + fees_5 + 0.02
 
         if cash_usd < min_5_cost:
             return {"action": "HOLD"}
 
-        if cash_usd < 12.0 or self.consecutive_losses >= 1:
+        # Risk-Managed Bankroll Sizing & Late-Session Push:
+        # Standard: 5-share floor under $12 to prevent drawdown.
+        # Late-Session Sprint: When close to qualifying (<= $80 needed) with solid cash (>= $7.50) after hour 20,
+        # moderately size up (e.g. 6-7 shares) to cross $1,000 before the 24h clock runs out!
+        if (
+            cash_usd >= 7.50
+            and (TARGET_VOLUME_USD - eligible_vol <= 150.0)
+            and elapsed_hours >= 18.5
+            and self.consecutive_losses == 0
+        ):
+            tier_budget = min(4.88, max(min_5_cost, cash_usd * 0.50))
+        elif cash_usd < 12.0 or self.consecutive_losses >= 1:
             tier_budget = min_5_cost
         elif cash_usd < 20.0:
             tier_budget = min(4.88, max(min_5_cost, cash_usd * 0.40))
