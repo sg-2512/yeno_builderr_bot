@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import time
+
+# Ensure test suite runs in memory without polluting production state file
+os.environ["YENO_STATE_FILE"] = ":memory:"
+
 from yeno_production_bot import ProductionTradingBot, DecideRequestHandler
 
 
@@ -218,8 +223,56 @@ def run_tests() -> None:
     assert d15["action"] == "HOLD", f"Expected HOLD on normal 3c spread friction, got {d15}"
     print("  -> PASSED: STOP_LOSS_PER_SHARE_USD = 0.10 accommodates spread friction without premature dump!")
 
+    # Test 16: Atomic State Persistence and Recovery across process restart
+    tmp_state_file = "test_persistence_state.json"
+    if os.path.exists(tmp_state_file):
+        os.remove(tmp_state_file)
+    try:
+        bot16_a = ProductionTradingBot(state_file_path=tmp_state_file)
+        obs16 = copy.deepcopy(base_obs)
+        obs16["account"]["eligibleVolumeUsd"] = 1001.0
+        d16_a = bot16_a.decide(obs16)
+        assert d16_a["action"] == "HOLD"
+        assert bot16_a.qualified_and_flat is True
+        assert os.path.exists(tmp_state_file), "Expected state file to be written to disk"
+
+        # Now simulate process restart: instantiate a new bot with the same state file
+        bot16_b = ProductionTradingBot(state_file_path=tmp_state_file)
+        assert bot16_b.qualified_and_flat is True, "Expected qualified_and_flat to be restored from disk"
+        # Even with an attractive entry signal, the restored bot must respect qualified_and_flat!
+        d16_b = bot16_b.decide(base_obs)
+        assert d16_b["action"] == "HOLD", f"Expected HOLD from restored state, got {d16_b}"
+        print(f"\n[TEST 16] State Persistence & Recovery: {d16_b}")
+        print("  -> PASSED: Runtime state correctly saved to disk and restored across restarts!")
+    finally:
+        if os.path.exists(tmp_state_file):
+            os.remove(tmp_state_file)
+        if os.path.exists(f"{tmp_state_file}.tmp"):
+            os.remove(f"{tmp_state_file}.tmp")
+
+    # Test 17: Favorite-Lag Guard (Reject ask >= 0.75 when model target_prob < best_ask)
+    bot17_reject = ProductionTradingBot(state_file_path=":memory:")
+    obs17 = copy.deepcopy(base_obs)
+    obs17["account"]["cashUsd"] = 20.0  # Cash tier permits asks up to 0.82
+    obs17["books"]["YES"]["asks"] = [[0.80, 100]]
+    obs17["books"]["YES"]["bids"] = [[0.78, 100]]
+    # Set BTC mid such that gap is positive and target_prob is ~0.71 (< 0.80 ask)
+    obs17["reference"]["btcMidUsd"] = 80455.0
+    d17_reject = bot17_reject.decide(obs17)
+    print(f"\n[TEST 17] Favorite-Lag Guard Rejection (Ask=0.80 > Model=0.71): {d17_reject}")
+    assert d17_reject["action"] == "HOLD", f"Expected HOLD when ask > target_prob, got {d17_reject}"
+
+    # Now make the gap larger so target_prob is ~0.89 (> 0.80 ask)
+    bot17_accept = ProductionTradingBot(state_file_path=":memory:")
+    obs17_fav = copy.deepcopy(obs17)
+    obs17_fav["reference"]["btcMidUsd"] = 80490.0
+    d17_accept = bot17_accept.decide(obs17_fav)
+    print(f"  -> Favorite-Lag Guard Acceptance (Ask=0.80 < Model=0.89): {d17_accept}")
+    assert d17_accept["action"] == "BUY", f"Expected BUY when target_prob > ask, got {d17_accept}"
+    print("  -> PASSED: Favorite-Lag Guard safely blocks buying fully priced or overpriced favorites!")
+
     print("\n" + "=" * 65)
-    print("ALL LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
+    print("ALL 17 LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
     print("=" * 65)
 
 

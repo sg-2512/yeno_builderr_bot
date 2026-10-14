@@ -30,7 +30,7 @@ def calculate_fees(fills: list[tuple[float, float]]) -> float:
 def run_real_day_evaluation(candles_1440: list[dict[str, float]], bot_cls: type[ProductionTradingBot] = ProductionTradingBot) -> dict[str, Any]:
     assert len(candles_1440) == 1440, f"Expected 1440 bars, got {len(candles_1440)}"
     
-    bot = bot_cls()
+    bot = bot_cls(state_file_path=":memory:")
     cash = 10.0
     eligible_volume = 0.0
     completed_cycles = 0
