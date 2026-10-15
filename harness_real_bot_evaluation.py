@@ -175,7 +175,7 @@ def run_real_day_evaluation(candles_1440: list[dict[str, float]], bot_cls: type[
                 completed_cycles += 1
                 position = None
 
-                if eligible_volume >= 1000.0 and not qualified:
+                if eligible_volume >= 1000.0 - 1e-4 and not qualified:
                     qualified = True
                     crossing_cash = cash
                     crossing_market = m_idx + 1

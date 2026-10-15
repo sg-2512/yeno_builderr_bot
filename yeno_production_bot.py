@@ -300,7 +300,7 @@ class ProductionTradingBot:
         # 1. Clean Crossing Lock Check
         # ----------------------------------------------------------------------
         # Once target volume is achieved and position is flat, permanently LOCK IN FLAT!
-        if eligible_vol >= TARGET_VOLUME_USD and position is None:
+        if eligible_vol >= TARGET_VOLUME_USD - 1e-4 and position is None:
             self.qualified_and_flat = True
             self._save_state()
             return {"action": "HOLD"}
@@ -336,9 +336,10 @@ class ProductionTradingBot:
                     self.cooldown_until = -math.inf
                 elif cycle_pnl < -1e-4:
                     self.consecutive_losses += 1
-                    # Cooldown on 2 consecutive losses: 10 minutes to prevent whipsaw clustering
-                    if self.consecutive_losses >= 2:
-                        self.cooldown_until = now + 600.0
+                    # Cooldown on 3 consecutive losses (or 2 if low bankroll < $12): 5 minutes to reset market
+                    thresh = 2 if cash_usd < 12.0 else 3
+                    if self.consecutive_losses >= thresh:
+                        self.cooldown_until = now + 300.0
                 self.pre_trade_cash_usd = cash_usd
                 self._save_state()
             else:
@@ -494,8 +495,13 @@ class ProductionTradingBot:
                 return {"action": "HOLD"}
 
         # Volatility-Scaled Base Regime Gap (Disciplined: never degenerates into noise gambling)
-        # Late-Session Finish Push: If healthy cash (>= $8.0) and <= $50 vol needed after 21h, safely lower gap floor
-        if cash_usd >= 8.0 and (TARGET_VOLUME_USD - eligible_vol <= 50.0) and elapsed_hours >= 21.0:
+        # Late-Session Finish Push: If healthy cash (>= $8.0) and <= $120 vol needed after 20h, safely lower gap floor
+        vol_needed = TARGET_VOLUME_USD - eligible_vol
+        if (
+            cash_usd >= 8.0
+            and elapsed_hours >= 20.0
+            and (vol_needed <= 120.0 or (cash_usd >= 25.0 and vol_needed <= 200.0))
+        ):
             min_required_gap = max(8.0 * p_scale, min(24.0 * p_scale, dynamic_sigma * 0.16))
         else:
             min_required_gap = max(12.0 * p_scale, min(28.0 * p_scale, dynamic_sigma * 0.22))
@@ -639,7 +645,7 @@ class ProductionTradingBot:
         if est_5 is None:
             return {"action": "HOLD"}
         gross_5, fees_5 = est_5
-        min_5_cost = gross_5 + fees_5 + 0.02
+        min_5_cost = gross_5 + fees_5 + (BUY_HEADROOM_PER_SHARE * min_order_size)
 
         if cash_usd < min_5_cost:
             return {"action": "HOLD"}
