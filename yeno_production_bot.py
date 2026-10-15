@@ -168,7 +168,7 @@ def _estimate_sell(bids: Any, shares: float) -> tuple[float, float] | None:
 
 class ProductionTradingBot:
     def __init__(self, state_file_path: str | None = None) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.state_file_path = state_file_path if state_file_path is not None else STATE_FILE_PATH
         self.market_id: str | None = None
         self.position_was_open: bool = False
@@ -183,6 +183,11 @@ class ProductionTradingBot:
         self.cooldown_until: float = -math.inf
         self.pre_trade_cash_usd: float = 10.0
         self.session_start_time: float = -math.inf
+        self._state_event = threading.Event()
+        self._state_thread: threading.Thread | None = None
+        if self.state_file_path and self.state_file_path != ":memory:":
+            self._state_thread = threading.Thread(target=self._state_writer_worker, daemon=True)
+            self._state_thread.start()
         self._load_state()
 
     @staticmethod
@@ -200,6 +205,46 @@ class ProductionTradingBot:
             return default if math.isnan(f) else f
         except (ValueError, TypeError):
             return default
+
+    def _state_writer_worker(self) -> None:
+        """Background daemon ensuring disk writes never block the /decide response loop."""
+        while True:
+            self._state_event.wait()
+            self._state_event.clear()
+            self._write_state_to_disk()
+
+    def _write_state_to_disk(self) -> None:
+        """Atomically persist runtime state snapshot to disk."""
+        if not self.state_file_path or self.state_file_path == ":memory:":
+            return
+        try:
+            with self._lock:
+                data = {
+                    "session_start_time": self._safe_float_to_json(self.session_start_time),
+                    "completed_cycles": int(self.completed_cycles),
+                    "market_id": self.market_id,
+                    "exiting": bool(self.exiting),
+                    "position_entered_at": self._safe_float_to_json(self.position_entered_at),
+                    "consecutive_losses": int(self.consecutive_losses),
+                    "cooldown_until": self._safe_float_to_json(self.cooldown_until),
+                    "qualified_and_flat": bool(self.qualified_and_flat),
+                    "pre_trade_cash_usd": float(self.pre_trade_cash_usd),
+                }
+            tmp_path = f"{self.state_file_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self.state_file_path)
+        except Exception:
+            pass
+
+    def _save_state(self, sync: bool = False) -> None:
+        """Signal background worker to persist state (or write synchronously if sync=True)."""
+        if not self.state_file_path or self.state_file_path == ":memory:":
+            return
+        if sync or self._state_thread is None or not self._state_thread.is_alive():
+            self._write_state_to_disk()
+        else:
+            self._state_event.set()
 
     def _load_state(self) -> None:
         """Load persisted runtime state from disk if available (recovers session on restart)."""
@@ -219,29 +264,6 @@ class ProductionTradingBot:
                     self.cooldown_until = self._safe_float_from_json(data.get("cooldown_until"), self.cooldown_until)
                     self.qualified_and_flat = bool(data.get("qualified_and_flat", self.qualified_and_flat))
                     self.pre_trade_cash_usd = float(data.get("pre_trade_cash_usd", self.pre_trade_cash_usd))
-        except Exception:
-            pass
-
-    def _save_state(self) -> None:
-        """Atomically persist runtime state to disk to survive container/process restarts."""
-        if not self.state_file_path or self.state_file_path == ":memory:":
-            return
-        try:
-            data = {
-                "session_start_time": self._safe_float_to_json(self.session_start_time),
-                "completed_cycles": int(self.completed_cycles),
-                "market_id": self.market_id,
-                "exiting": bool(self.exiting),
-                "position_entered_at": self._safe_float_to_json(self.position_entered_at),
-                "consecutive_losses": int(self.consecutive_losses),
-                "cooldown_until": self._safe_float_to_json(self.cooldown_until),
-                "qualified_and_flat": bool(self.qualified_and_flat),
-                "pre_trade_cash_usd": float(self.pre_trade_cash_usd),
-            }
-            tmp_path = f"{self.state_file_path}.tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, self.state_file_path)
         except Exception:
             pass
 
@@ -277,11 +299,11 @@ class ProductionTradingBot:
 
         # Session Elapsed Progress:
         # Reconstruct progress from volume and completed cycles to survive container amnesia / restarts
+        eval_window = float(rules.get("evaluationWindowHours", 24.0)) if isinstance(rules, dict) else 24.0
         raw_elapsed = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0.0 else 0.0
-        inferred_by_vol = (eligible_vol / TARGET_VOLUME_USD) * 20.0
-        inferred_by_cycles = (float(account.get("completedCycles", self.completed_cycles)) / 140.0) * 20.0
-        elapsed_hours = max(raw_elapsed, inferred_by_vol, inferred_by_cycles)
-        expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
+        inferred_by_vol = min(eval_window, (eligible_vol / TARGET_VOLUME_USD) * eval_window)
+        inferred_by_cycles = min(eval_window, (float(account.get("completedCycles", self.completed_cycles)) / 140.0) * eval_window)
+        elapsed_hours = min(eval_window, max(raw_elapsed, inferred_by_vol, inferred_by_cycles))
 
         # Continuously record BTC mid price into rolling 180s history on EVERY tick (even while holding positions)
         if isinstance(reference, dict) and "btcMidUsd" in reference:
@@ -301,7 +323,7 @@ class ProductionTradingBot:
         # Once target volume is achieved and position is flat, permanently LOCK IN FLAT!
         if eligible_vol >= TARGET_VOLUME_USD - 1e-4 and position is None:
             self.qualified_and_flat = True
-            self._save_state()
+            self._save_state(sync=True)
             return {"action": "HOLD"}
 
         if self.qualified_and_flat and position is None:
@@ -523,16 +545,22 @@ class ProductionTradingBot:
         prob_yes = _normal_cdf(z)
         prob_no = 1.0 - prob_yes
 
-        # Horizons 1 & 2: Adaptive Monotonic Momentum & Anti-Reversal Guard (2.0s to 45.0s)
-        # Filters out adverse short-term momentum shifts using the most recent observation in [2.0s, 45.0s].
-        # Scale-invariant threshold prevents sub-second live tick jitter while blocking real momentum reversals.
-        p_recent = [p_h for t_h, p_h in self.price_history if 2.0 <= now - t_h <= 45.0]
+        # Horizons 1 & 2: Adaptive Monotonic Momentum & Anti-Reversal Guard (2.0s to 75.0s)
+        # Filters out adverse short-term momentum shifts using recent price history.
+        # Threshold scales continuously with elapsed dt: rev_thresh = (8.0 + (0.25 * dt)) * p_scale.
+        # This protects against sudden live sub-second drops (> $8.50 in 2s) without noise rejections,
+        # while also validating properly on 60-second backtest bars (> $23.0 in 60s).
+        p_recent = [
+            (t_h, p_h) for t_h, p_h in self.price_history
+            if 2.0 <= now - t_h <= 75.0
+        ]
         if p_recent:
-            ref_recent = p_recent[-1]
-            rev_thresh = 12.0 * p_scale
-            if gap > 0 and btc_mid < ref_recent - rev_thresh:
+            t_ref, p_ref = p_recent[-1]
+            dt = max(2.0, now - t_ref)
+            rev_thresh = (8.0 + (0.25 * dt)) * p_scale
+            if gap > 0 and btc_mid < p_ref - rev_thresh:
                 return {"action": "HOLD"}
-            if gap < 0 and btc_mid > ref_recent + rev_thresh:
+            if gap < 0 and btc_mid > p_ref + rev_thresh:
                 return {"action": "HOLD"}
 
         # Horizon 3: Technical Trend Analysis (EMA Alignment, Linear Velocity & RSI Exhaustion)

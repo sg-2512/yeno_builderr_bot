@@ -307,7 +307,7 @@ def run_tests() -> None:
     bot20 = ProductionTradingBot(state_file_path=":memory:")
     obs20 = copy.deepcopy(base_obs)
     obs20["account"]["cashUsd"] = 15.0
-    obs20["account"]["eligibleVolumeUsd"] = 850.0  # At $850, inferred hours = (850/1000)*20 = 17.0h
+    obs20["account"]["eligibleVolumeUsd"] = 850.0  # At $850, inferred hours = (850/1000)*24 = 20.4h
     obs20["account"]["completedCycles"] = 120
     obs20["timestamp"] = 1700000000.0
     # Fresh bot without persisted session start time
@@ -327,7 +327,7 @@ def run_tests() -> None:
         bot21.session_start_time = -math.inf
         bot21.position_entered_at = -math.inf
         bot21.cooldown_until = -math.inf
-        bot21._save_state()
+        bot21._save_state(sync=True)
         with open(tmp_rfc_file, "r", encoding="utf-8") as f:
             raw_text = f.read()
         assert "-Infinity" not in raw_text, "Found non-standard -Infinity in state file"
@@ -346,8 +346,29 @@ def run_tests() -> None:
         if os.path.exists(f"{tmp_rfc_file}.tmp"):
             os.remove(f"{tmp_rfc_file}.tmp")
 
+    # Test 22: Asynchronous Non-Blocking State Persistence
+    tmp_async_file = "test_async_state.json"
+    if os.path.exists(tmp_async_file):
+        os.remove(tmp_async_file)
+    try:
+        bot22 = ProductionTradingBot(state_file_path=tmp_async_file)
+        assert bot22._state_thread is not None and bot22._state_thread.is_alive(), "Expected background writer thread to be active"
+        # Trigger an action that saves state (BUY)
+        d22 = bot22.decide(base_obs)
+        assert d22["action"] == "BUY"
+        # Background worker writes state asynchronously
+        time.sleep(0.05)
+        assert os.path.exists(tmp_async_file), "Expected background thread to asynchronously write state file"
+        print(f"\n[TEST 22] Asynchronous State Persistence: Background thread verified!")
+        print("  -> PASSED: State persists asynchronously without blocking the decision path!")
+    finally:
+        if os.path.exists(tmp_async_file):
+            os.remove(tmp_async_file)
+        if os.path.exists(f"{tmp_async_file}.tmp"):
+            os.remove(f"{tmp_async_file}.tmp")
+
     print("\n" + "=" * 65)
-    print("ALL 21 LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
+    print("ALL 22 LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
     print("=" * 65)
 
 
