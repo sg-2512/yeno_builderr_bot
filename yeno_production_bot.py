@@ -81,29 +81,6 @@ def _compute_obi(parsed_bids: list[tuple[float, float]], parsed_asks: list[tuple
     return (v_bid - v_ask) / total
 
 
-def _resample_price_series(
-    price_history: list[tuple[float, float]],
-    now: float,
-    window_sec: float = 60.0,
-    step_sec: float = 5.0,
-) -> list[float]:
-    """Resample irregularly-timed price ticks into fixed-interval price steps."""
-    if not price_history:
-        return []
-    n_steps = max(1, int(window_sec / step_sec))
-    grid_times = [now - (n_steps - i) * step_sec for i in range(n_steps + 1)]
-    samples: list[float] = []
-    idx = 0
-    n = len(price_history)
-    current_p = price_history[0][1]
-    for t_target in grid_times:
-        while idx < n and price_history[idx][0] <= t_target + 1e-6:
-            current_p = price_history[idx][1]
-            idx += 1
-        samples.append(current_p)
-    return samples
-
-
 def _compute_ema(prices: list[float], period: int) -> float:
     """Compute Exponential Moving Average (EMA) over a price series."""
     if not prices:
@@ -208,6 +185,22 @@ class ProductionTradingBot:
         self.session_start_time: float = -math.inf
         self._load_state()
 
+    @staticmethod
+    def _safe_float_to_json(val: float) -> float | None:
+        """Convert float to strictly RFC 8259 compliant JSON value (no -Infinity or NaN)."""
+        return None if (math.isinf(val) or math.isnan(val)) else val
+
+    @staticmethod
+    def _safe_float_from_json(val: Any, default: float) -> float:
+        """Safely restore float from JSON value (null converts back to default -math.inf)."""
+        if val is None:
+            return default
+        try:
+            f = float(val)
+            return default if math.isnan(f) else f
+        except (ValueError, TypeError):
+            return default
+
     def _load_state(self) -> None:
         """Load persisted runtime state from disk if available (recovers session on restart)."""
         if not self.state_file_path or self.state_file_path == ":memory:":
@@ -217,13 +210,13 @@ class ProductionTradingBot:
                 with open(self.state_file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    self.session_start_time = float(data.get("session_start_time", self.session_start_time))
+                    self.session_start_time = self._safe_float_from_json(data.get("session_start_time"), self.session_start_time)
                     self.completed_cycles = int(data.get("completed_cycles", self.completed_cycles))
                     self.market_id = data.get("market_id", self.market_id)
                     self.exiting = bool(data.get("exiting", self.exiting))
-                    self.position_entered_at = float(data.get("position_entered_at", self.position_entered_at))
+                    self.position_entered_at = self._safe_float_from_json(data.get("position_entered_at"), self.position_entered_at)
                     self.consecutive_losses = int(data.get("consecutive_losses", self.consecutive_losses))
-                    self.cooldown_until = float(data.get("cooldown_until", self.cooldown_until))
+                    self.cooldown_until = self._safe_float_from_json(data.get("cooldown_until"), self.cooldown_until)
                     self.qualified_and_flat = bool(data.get("qualified_and_flat", self.qualified_and_flat))
                     self.pre_trade_cash_usd = float(data.get("pre_trade_cash_usd", self.pre_trade_cash_usd))
         except Exception:
@@ -235,15 +228,15 @@ class ProductionTradingBot:
             return
         try:
             data = {
-                "session_start_time": self.session_start_time,
-                "completed_cycles": self.completed_cycles,
+                "session_start_time": self._safe_float_to_json(self.session_start_time),
+                "completed_cycles": int(self.completed_cycles),
                 "market_id": self.market_id,
-                "exiting": self.exiting,
-                "position_entered_at": self.position_entered_at,
-                "consecutive_losses": self.consecutive_losses,
-                "cooldown_until": self.cooldown_until,
-                "qualified_and_flat": self.qualified_and_flat,
-                "pre_trade_cash_usd": self.pre_trade_cash_usd,
+                "exiting": bool(self.exiting),
+                "position_entered_at": self._safe_float_to_json(self.position_entered_at),
+                "consecutive_losses": int(self.consecutive_losses),
+                "cooldown_until": self._safe_float_to_json(self.cooldown_until),
+                "qualified_and_flat": bool(self.qualified_and_flat),
+                "pre_trade_cash_usd": float(self.pre_trade_cash_usd),
             }
             tmp_path = f"{self.state_file_path}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -278,7 +271,16 @@ class ProductionTradingBot:
         if self.session_start_time <= 0.0 and now > 0.0:
             self.session_start_time = now
 
-        elapsed_hours = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0.0 else 0.0
+        cash_usd = float(account.get("cashUsd", 0.0))
+        eligible_vol = float(account.get("eligibleVolumeUsd", 0.0))
+        position = account.get("position")
+
+        # Session Elapsed Progress:
+        # Reconstruct progress from volume and completed cycles to survive container amnesia / restarts
+        raw_elapsed = (now - self.session_start_time) / 3600.0 if self.session_start_time > 0.0 else 0.0
+        inferred_by_vol = (eligible_vol / TARGET_VOLUME_USD) * 20.0
+        inferred_by_cycles = (float(account.get("completedCycles", self.completed_cycles)) / 140.0) * 20.0
+        elapsed_hours = max(raw_elapsed, inferred_by_vol, inferred_by_cycles)
         expected_vol = (elapsed_hours / 24.0) * TARGET_VOLUME_USD
 
         # Continuously record BTC mid price into rolling 180s history on EVERY tick (even while holding positions)
@@ -292,9 +294,6 @@ class ProductionTradingBot:
 
         seconds_to_close = float(market.get("secondsToClose", 0.0))
         market_id = str(market.get("id", ""))
-        cash_usd = float(account.get("cashUsd", 0.0))
-        eligible_vol = float(account.get("eligibleVolumeUsd", 0.0))
-        position = account.get("position")
 
         # ----------------------------------------------------------------------
         # 1. Clean Crossing Lock Check
@@ -397,6 +396,13 @@ class ProductionTradingBot:
                 paid = float(position.get("buy_gross_usd", 0.0)) + float(position.get("buy_fees_usd", 0.0))
                 already_received = float(position.get("sell_gross_usd", 0.0)) - float(position.get("sell_fees_usd", 0.0))
                 full_cycle_pnl = already_received + sell_gross - sell_fees - paid
+
+                # High-Conviction Gain Harvest: If outcome bid reaches >= 0.94 and trade is in profit, lock it in!
+                best_bid_val = bids[0][0] if (bids and isinstance(bids[0], (list, tuple))) else (sell_gross / shares if shares > 0 else 0.0)
+                if best_bid_val >= 0.94 and full_cycle_pnl > 0.0:
+                    self.exiting = True
+                    self._save_state()
+                    return {"action": "SELL"}
 
                 # Avellaneda-Stoikov Dynamic Reservation Price Exit Engine:
                 # - Early holding (t > 85s): Target full profit (+0.02 / share)
@@ -517,22 +523,16 @@ class ProductionTradingBot:
         prob_yes = _normal_cdf(z)
         prob_no = 1.0 - prob_yes
 
-        # Horizon 1: Micro-Momentum (3 seconds: clamped between 2.5s and 8.0s)
-        p_3s = [p_h for t_h, p_h in self.price_history if 2.5 <= now - t_h <= 8.0]
-        if p_3s:
-            ref_3s = p_3s[-1]
-            if gap > 0 and btc_mid < ref_3s - 10.0 * p_scale:
+        # Horizons 1 & 2: Adaptive Monotonic Momentum & Anti-Reversal Guard (2.0s to 45.0s)
+        # Filters out adverse short-term momentum shifts using the most recent observation in [2.0s, 45.0s].
+        # Scale-invariant threshold prevents sub-second live tick jitter while blocking real momentum reversals.
+        p_recent = [p_h for t_h, p_h in self.price_history if 2.0 <= now - t_h <= 45.0]
+        if p_recent:
+            ref_recent = p_recent[-1]
+            rev_thresh = 12.0 * p_scale
+            if gap > 0 and btc_mid < ref_recent - rev_thresh:
                 return {"action": "HOLD"}
-            if gap < 0 and btc_mid > ref_3s + 10.0 * p_scale:
-                return {"action": "HOLD"}
-
-        # Horizon 2: Tactical Momentum (15 seconds: clamped between 12.0s and 25.0s)
-        p_15s = [p_h for t_h, p_h in self.price_history if 12.0 <= now - t_h <= 25.0]
-        if p_15s:
-            ref_15s = p_15s[-1]
-            if gap > 0 and btc_mid < ref_15s - 14.0 * p_scale:
-                return {"action": "HOLD"}
-            if gap < 0 and btc_mid > ref_15s + 14.0 * p_scale:
+            if gap < 0 and btc_mid > ref_recent + rev_thresh:
                 return {"action": "HOLD"}
 
         # Horizon 3: Technical Trend Analysis (EMA Alignment, Linear Velocity & RSI Exhaustion)
@@ -615,10 +615,10 @@ class ProductionTradingBot:
             return {"action": "HOLD"}
 
         # Favorite-Lag Guard: Never pay premium prices (ask >= 0.75) unless the model's win probability
-        # strictly exceeds the ask (target_prob >= best_ask). This ensures the order book lags our model,
-        # preventing buying into fully priced or overpriced favorites.
+        # is within 1 cent of the ask (target_prob >= best_ask - 0.01). This accommodates normal 1-cent
+        # half-spread quotes from market makers while strictly blocking overpriced favorites.
         target_prob = prob_yes if side == "YES" else prob_no
-        if best_ask >= 0.75 and target_prob < best_ask:
+        if best_ask >= 0.75 and target_prob < (best_ask - 0.01):
             return {"action": "HOLD"}
 
         # Model Directional & Valuation Validation:
@@ -639,7 +639,9 @@ class ProductionTradingBot:
         # 6. Dynamic Position Sizing (Tiered Anti-Ruin & Volume Acceleration Engine)
         # ----------------------------------------------------------------------
         rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
-        available_cash_limit = max(0.0, cash_usd - 0.15)
+        # Available cash limit: Zero reserve during deep drawdown (< $5.00) to allow 5-share recovery purchases;
+        # otherwise preserve a $0.15 cushion for fees and rounding.
+        available_cash_limit = cash_usd if cash_usd < 5.0 else max(0.0, cash_usd - 0.15)
         # Exact-cost 5-share sizing floor via order book depth simulation (avoids premature lockout at $2.50-$2.68 cash)
         est_5 = _estimate_buy(asks, min_order_size)
         if est_5 is None:
