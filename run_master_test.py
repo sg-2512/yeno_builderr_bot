@@ -11,9 +11,14 @@ Executes:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
+
+# Ensure master battery runs in memory without polluting production state file on disk
+os.environ["YENO_STATE_FILE"] = ":memory:"
+
 from importlib import import_module
 from yeno_production_bot import ProductionTradingBot, run_server
 from yeno_simulator import MarketReplayDay
@@ -28,10 +33,16 @@ def run_master_battery() -> None:
     # TIER 1: UNIT & CONTRACT EDGE-CASE VERIFICATION
     # -------------------------------------------------------------------------
     print("\n[TIER 1] RUNNING CONTRACT EDGE-CASE TESTS...")
+    if os.path.exists("yeno_bot_state.json"):
+        try:
+            os.remove("yeno_bot_state.json")
+        except Exception:
+            pass
     base_obs = json.load(open("yeno-sample-observation.json"))
 
     # Test 1: Normal BUY under $5 cap
-    bot = ProductionTradingBot()
+    bot = ProductionTradingBot(state_file_path=":memory:")
+
     d1 = bot.decide(base_obs)
     assert d1["action"] == "BUY", f"Test 1 failed: {d1}"
     assert 0 < d1["maxCashUsd"] <= 5.0, f"Exceeded $5 cap: {d1}"
@@ -102,6 +113,7 @@ def run_master_battery() -> None:
         bot.decide(base_obs)
     total_sec = time.perf_counter() - t0
     avg_ms = (total_sec / 5000) * 1000.0
+    assert avg_ms < 200.0, f"Latency SLA violation: {avg_ms:.4f} ms >= 200 ms"
     print(f"  [PASS] Total Time for 5,000 Calls: {total_sec:.4f}s")
     print(f"  [PASS] Average Latency per Call:   {avg_ms:.5f} ms")
     print(f"  [PASS] Builderr Latency Limit:     200.000 ms")
@@ -113,6 +125,7 @@ def run_master_battery() -> None:
     print("\n[TIER 3] EVALUATING PERFORMANCE ACROSS 600 REAL 5-MINUTE BTC ROUNDS...")
     from evaluate_profitability import evaluate_real_historical_markets
     real_results = evaluate_real_historical_markets()
+    assert real_results.get("qualified") is True, f"Failed to qualify on 600 BTC rounds: {real_results}"
 
     # -------------------------------------------------------------------------
     # TIER 4: 3-DAY MONTE CARLO STRESS TEST VS HOUSE BOT
@@ -135,6 +148,8 @@ def run_master_battery() -> None:
         res_h = sim_h.run(hb_module.HouseBot)
         house_volumes.append(res_h["final_volume"])
         house_cashes.append(res_h["final_cash"])
+
+    assert all(prod_flats), "Bot failed to finish flat in Monte Carlo replay"
 
     print("\n" + "-" * 75)
     print("MONTE CARLO STRESS TEST COMPARISON TABLE")

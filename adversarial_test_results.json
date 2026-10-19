@@ -1,0 +1,314 @@
+{
+  "buy_stats": {
+    "total_tests": 26128,
+    "buy_signals": 6697,
+    "hold_signals": 19431,
+    "max_cash_usd_seen": 4.88,
+    "max_fee_inclusive_spend_seen": 4.79334,
+    "max_spend_with_slippage_seen": 4.79334,
+    "breaches_over_5_00": 0,
+    "breaches_over_4_88": 0,
+    "evaluator_spend_breaches_over_5_00": 0,
+    "counterexamples": []
+  },
+  "liq_stats": {
+    "total_tests": 352,
+    "sell_signals": 304,
+    "hold_signals": 48,
+    "fails_at_50s": 12,
+    "fails_at_25s": 0,
+    "fails_at_15s": 0,
+    "fails_with_empty_bids": 24,
+    "fails_with_present_bids": 24,
+    "counterexamples": [
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "default (50s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 60.0,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 55.0,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0001,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 50.0,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 49.999,
+        "bid_scenario": "normal_even",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 49.999,
+        "bid_scenario": "slight_loss",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 49.999,
+        "bid_scenario": "insufficient_depth",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 49.999,
+        "bid_scenario": "empty_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 49.999,
+        "bid_scenario": "none_bids",
+        "action": "HOLD"
+      },
+      {
+        "config": "tuned (49s)",
+        "seconds_to_close": 49.999,
+        "bid_scenario": "malformed_bids",
+        "action": "HOLD"
+      }
+    ]
+  }
+}

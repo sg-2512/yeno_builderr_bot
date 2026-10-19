@@ -367,8 +367,19 @@ def run_tests() -> None:
         if os.path.exists(f"{tmp_async_file}.tmp"):
             os.remove(f"{tmp_async_file}.tmp")
 
+    # Test 23: Defensive Guards against null rules and unsorted books
+    bot23 = ProductionTradingBot(state_file_path=":memory:")
+    obs23 = copy.deepcopy(base_obs)
+    obs23["rules"] = None
+    obs23["books"]["YES"]["bids"] = [[0.68, 50], [0.69, 100]]  # unsorted bids (ascending: 0.68, 0.69)
+    d23 = bot23.decide(obs23)
+    assert d23["action"] == "BUY" and d23["outcome"] == "YES", f"Expected BUY YES, got {d23}"
+    assert 0 < d23["maxCashUsd"] <= 4.88
+    print(f"\n[TEST 23] Defensive Type Guards (rules=None, unsorted books): {d23}")
+    print("  -> PASSED: Bot safely handles null rules and unsorted books without crashing!")
+
     print("\n" + "=" * 65)
-    print("ALL 22 LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
+    print("ALL 23 LOCAL TESTS PASSED WITH 100% COMPLIANCE!")
     print("=" * 65)
 
 

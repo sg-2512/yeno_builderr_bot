@@ -9,3 +9,5 @@ data_2025_cache/
 data_2024_cache/
 data_2020_2023_cache/
 data_2018_2019_cache/
+yeno_bot_state*.json
+.agents/

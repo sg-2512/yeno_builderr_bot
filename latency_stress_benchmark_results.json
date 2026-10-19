@@ -1,0 +1,122 @@
+{
+  "suite_1_heavy_buy": {
+    "suite": "SUITE 1: 10,000 Heavy BUY Decisions (Full Math Engine)",
+    "total_calls": 10000,
+    "total_time_s": 1.0221,
+    "throughput_calls_sec": 9783.9,
+    "min_ms": 0.0317,
+    "mean_ms": 0.10134,
+    "stdev_ms": 0.03527,
+    "p50_ms": 0.1042,
+    "p90_ms": 0.1236,
+    "p95_ms": 0.1425,
+    "p99_ms": 0.2191,
+    "p999_ms": 0.3838,
+    "max_ms": 0.611,
+    "sla_200ms_exceeded": 0,
+    "over_10ms_count": 0,
+    "over_1ms_count": 0,
+    "p99_headroom_factor": 912.8,
+    "action_breakdown": {
+      "BUY": 8555,
+      "SELL": 0,
+      "HOLD": 1445
+    }
+  },
+  "suite_2_heavy_sell": {
+    "suite": "SUITE 2: 10,000 Heavy SELL / Exit Decisions",
+    "total_calls": 10000,
+    "total_time_s": 0.1903,
+    "throughput_calls_sec": 52547.0,
+    "min_ms": 0.0157,
+    "mean_ms": 0.0185,
+    "stdev_ms": 0.00802,
+    "p50_ms": 0.0171,
+    "p90_ms": 0.0202,
+    "p95_ms": 0.0216,
+    "p99_ms": 0.0439,
+    "p999_ms": 0.1334,
+    "max_ms": 0.2708,
+    "sla_200ms_exceeded": 0,
+    "over_10ms_count": 0,
+    "over_1ms_count": 0,
+    "p99_headroom_factor": 4555.8,
+    "action_breakdown": {
+      "BUY": 0,
+      "SELL": 10000,
+      "HOLD": 0
+    }
+  },
+  "suite_3_mixed_regimes": {
+    "suite": "SUITE 3: 12,000 Mixed Adversarial Regimes",
+    "total_calls": 12000,
+    "total_time_s": 0.1122,
+    "throughput_calls_sec": 106943.2,
+    "min_ms": 0.0063,
+    "mean_ms": 0.00902,
+    "stdev_ms": 0.00771,
+    "p50_ms": 0.0071,
+    "p90_ms": 0.0132,
+    "p95_ms": 0.0151,
+    "p99_ms": 0.0285,
+    "p999_ms": 0.0841,
+    "max_ms": 0.6036,
+    "sla_200ms_exceeded": 0,
+    "over_10ms_count": 0,
+    "over_1ms_count": 0,
+    "p99_headroom_factor": 7017.5,
+    "action_breakdown": {
+      "BUY": 0,
+      "SELL": 3000,
+      "HOLD": 9000
+    }
+  },
+  "suite_4_real_btc_stream": {
+    "suite": "SUITE 4: 10,080 Real BTC Candlestick Stream (7-Day Equivalent)",
+    "total_calls": 10080,
+    "total_time_s": 0.0646,
+    "throughput_calls_sec": 156107.2,
+    "min_ms": 0.0028,
+    "mean_ms": 0.00605,
+    "stdev_ms": 0.00834,
+    "p50_ms": 0.0044,
+    "p90_ms": 0.0061,
+    "p95_ms": 0.0087,
+    "p99_ms": 0.0474,
+    "p999_ms": 0.0715,
+    "max_ms": 0.1697,
+    "sla_200ms_exceeded": 0,
+    "over_10ms_count": 0,
+    "over_1ms_count": 0,
+    "p99_headroom_factor": 4219.4,
+    "action_breakdown": {
+      "BUY": 331,
+      "SELL": 0,
+      "HOLD": 9749
+    }
+  },
+  "suite_5_disk_persisted": {
+    "suite": "SUITE 5: 10,000 Heavy BUY Calls with Active Disk Persistence",
+    "total_calls": 10000,
+    "total_time_s": 1.0416,
+    "throughput_calls_sec": 9600.5,
+    "min_ms": 0.0319,
+    "mean_ms": 0.10327,
+    "stdev_ms": 0.03933,
+    "p50_ms": 0.1058,
+    "p90_ms": 0.1234,
+    "p95_ms": 0.1449,
+    "p99_ms": 0.242,
+    "p999_ms": 0.4158,
+    "max_ms": 1.0832,
+    "sla_200ms_exceeded": 0,
+    "over_10ms_count": 0,
+    "over_1ms_count": 1,
+    "p99_headroom_factor": 826.4,
+    "action_breakdown": {
+      "BUY": 8555,
+      "SELL": 0,
+      "HOLD": 1445
+    }
+  }
+}

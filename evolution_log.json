@@ -1,0 +1,81 @@
+[
+  {
+    "iteration": 6,
+    "timestamp": 1792393627.9714952,
+    "mutations": [
+      "forced_exit_sec: 50.0 -> 49.0",
+      "stop_loss: 0.1 -> 0.12",
+      "vol_scale_mult: 2.5 -> 2.3"
+    ],
+    "train_fitness": 63.591,
+    "val_fitness": 60.468,
+    "old_val_fitness": 42.28,
+    "train_mean_cash": 60.87,
+    "val_mean_cash": 62.71,
+    "config": {
+      "base_min_gap": 12.0,
+      "vol_scale_mult": 2.3,
+      "take_profit": 0.025,
+      "mid_hold_profit": 0.01,
+      "pre_expiry_harvest": -0.03,
+      "stop_loss": 0.12,
+      "forced_exit_sec": 49.0,
+      "obi_threshold": -0.3,
+      "tier2_budget_pct": 0.4
+    }
+  },
+  {
+    "iteration": 22,
+    "timestamp": 1792394460.2108796,
+    "mutations": [
+      "take_profit: 0.025 -> 0.0225",
+      "pre_expiry_harvest: -0.03 -> -0.02",
+      "base_min_gap: 12.0 -> 11.0",
+      "tier2_budget_pct: 0.4 -> 0.3"
+    ],
+    "train_fitness": 78.743,
+    "val_fitness": 79.757,
+    "old_val_fitness": 60.468,
+    "train_mean_cash": 77.67,
+    "val_mean_cash": 78.48,
+    "config": {
+      "base_min_gap": 11.0,
+      "vol_scale_mult": 2.3,
+      "take_profit": 0.0225,
+      "mid_hold_profit": 0.01,
+      "pre_expiry_harvest": -0.02,
+      "stop_loss": 0.12,
+      "forced_exit_sec": 49.0,
+      "obi_threshold": -0.3,
+      "tier2_budget_pct": 0.3
+    }
+  },
+  {
+    "iteration": 29,
+    "timestamp": 1792394461.4410734,
+    "mutations": [
+      "obi_threshold: -0.3 -> -0.25",
+      "base_min_gap: 11.0 -> 10.0",
+      "pre_expiry_harvest: -0.02 -> -0.025",
+      "stop_loss: 0.12 -> 0.13",
+      "take_profit: 0.0225 -> 0.025",
+      "tier2_budget_pct: 0.3 -> 0.35"
+    ],
+    "train_fitness": 85.982,
+    "val_fitness": 86.027,
+    "old_val_fitness": 79.757,
+    "train_mean_cash": 82.86,
+    "val_mean_cash": 84.11,
+    "config": {
+      "base_min_gap": 10.0,
+      "vol_scale_mult": 2.3,
+      "take_profit": 0.025,
+      "mid_hold_profit": 0.01,
+      "pre_expiry_harvest": -0.025,
+      "stop_loss": 0.13,
+      "forced_exit_sec": 49.0,
+      "obi_threshold": -0.25,
+      "tier2_budget_pct": 0.35
+    }
+  }
+]

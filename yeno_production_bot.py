@@ -15,16 +15,22 @@ from __future__ import annotations
 import json
 import math
 import os
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 # ==============================================================================
-# STRATEGY HYPERPARAMETERS
+# STRATEGY HYPERPARAMETERS & FAST SINGLETONS
 # ==============================================================================
+ACTION_HOLD: dict[str, str] = {"action": "HOLD"}
+ACTION_SELL: dict[str, str] = {"action": "SELL"}
+
 STATE_FILE_PATH = os.environ.get("YENO_STATE_FILE", "yeno_bot_state.json")
+CONFIG_FILE_PATH = os.environ.get("YENO_CONFIG_FILE", "bot_hyperparameters.json")
 MAX_BUY_CASH_CEILING = 4.88            # Safe buffer below $5.00 fee-inclusive cap
+
 BUY_HEADROOM_PER_SHARE = 0.015         # Buffer against 250ms quote jumps (prevents sub-minOrderSize rejections)
 TARGET_VOLUME_USD = 1000.0             # Official volume qualification target
 MAX_SPREAD_USD = 0.03                  # Strict spread filter (reject wide spreads)
@@ -35,12 +41,13 @@ BTC_SIGMA_PER_MIN_USD = 45.0           # Calibrated BTC 1-minute volatility
 MAX_CYCLES_PER_MARKET = 3              # Allow up to 3 trades per 5m market when opportunities appear
 ENTRY_MAX_SECONDS_TO_CLOSE = 240.0     # Scan for entries once trend establishes (t <= 4 min)
 ENTRY_MIN_SECONDS_TO_CLOSE = 60.0      # Cut off entries with <= 60s left to guarantee exit runway
-FORCED_EXIT_SECONDS = 45.0             # Standard exit threshold before expiry decay
+FORCED_EXIT_SECONDS = 50.0             # Hard liquidation window before 15s freeze to guarantee volume
 EMERGENCY_EXIT_SECONDS = 25.0          # Hard emergency exit: sweep bids before 15s freeze
 REENTRY_COOLDOWN_SECONDS = 2.0         # Wait between trades to avoid whipsaw entries
 MAX_REFERENCE_AGE_SECONDS = 1.5        # Max allowable staleness of BTC reference data
 STOP_LOSS_PER_SHARE_USD = 0.10         # Disciplined loss limit per share (accommodates 3c spread friction)
 TAKE_PROFIT_PER_SHARE_USD = 0.025      # Lock in net profit (+2.5 cents/share after all fees)
+
 
 
 def _normal_cdf(z: float) -> float:
@@ -167,10 +174,32 @@ def _estimate_sell(bids: Any, shares: float) -> tuple[float, float] | None:
 
 
 class ProductionTradingBot:
-    def __init__(self, state_file_path: str | None = None) -> None:
+    def __init__(self, state_file_path: str | None = None, config: dict[str, Any] | None = None) -> None:
         self._lock = threading.RLock()
         self.state_file_path = state_file_path if state_file_path is not None else STATE_FILE_PATH
+        self.config: dict[str, Any] = {
+            "base_min_gap": BASE_MIN_GAP_USD,
+            "vol_scale_mult": 2.5,
+            "take_profit": TAKE_PROFIT_PER_SHARE_USD,
+            "mid_hold_profit": 0.010,
+            "pre_expiry_harvest": -0.030,
+            "stop_loss": STOP_LOSS_PER_SHARE_USD,
+            "forced_exit_sec": FORCED_EXIT_SECONDS,
+            "obi_threshold": -0.30,
+            "tier2_budget_pct": 0.40,
+        }
+        if config is not None:
+            self.config.update(config)
+        elif os.path.exists(CONFIG_FILE_PATH):
+            try:
+                with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+                    file_cfg = json.load(f)
+                if isinstance(file_cfg, dict):
+                    self.config.update(file_cfg)
+            except Exception:
+                pass
         self.market_id: str | None = None
+
         self.position_was_open: bool = False
         self.completed_cycles: int = 0
         self.last_flat_at: float = -math.inf
@@ -277,16 +306,17 @@ class ProductionTradingBot:
                 try:
                     if isinstance(observation, dict) and observation.get("account", {}).get("position") is not None:
                         self.exiting = True
-                        return {"action": "SELL"}
+                        return ACTION_SELL
                 except Exception:
                     pass
-                return {"action": "HOLD"}
+                return ACTION_HOLD
+
 
     def _decide_impl(self, observation: dict[str, Any]) -> dict[str, Any]:
-        market = observation.get("market", {})
-        account = observation.get("account", {})
-        books = observation.get("books", {})
-        rules = observation.get("rules", {})
+        market = observation.get("market") or {}
+        account = observation.get("account") or {}
+        books = observation.get("books") or {}
+        rules = observation.get("rules") or {}
         reference = observation.get("reference")
         
         now = float(observation.get("timestamp", 0.0))
@@ -297,6 +327,17 @@ class ProductionTradingBot:
         eligible_vol = float(account.get("eligibleVolumeUsd", 0.0))
         position = account.get("position")
 
+        base_min_gap = float(self.config.get("base_min_gap", BASE_MIN_GAP_USD))
+        vol_scale_mult = float(self.config.get("vol_scale_mult", 2.5))
+        take_profit = float(self.config.get("take_profit", TAKE_PROFIT_PER_SHARE_USD))
+        mid_hold_profit = float(self.config.get("mid_hold_profit", 0.010))
+        pre_expiry_harvest = float(self.config.get("pre_expiry_harvest", -0.030))
+        stop_loss = float(self.config.get("stop_loss", STOP_LOSS_PER_SHARE_USD))
+        forced_exit_sec = float(self.config.get("forced_exit_sec", FORCED_EXIT_SECONDS))
+        obi_thresh = float(self.config.get("obi_threshold", -0.30))
+        tier2_budget_pct = float(self.config.get("tier2_budget_pct", 0.40))
+
+
         # Session Elapsed Progress:
         # Reconstruct progress from volume and completed cycles to survive container amnesia / restarts
         eval_window = float(rules.get("evaluationWindowHours", 24.0)) if isinstance(rules, dict) else 24.0
@@ -305,12 +346,12 @@ class ProductionTradingBot:
         inferred_by_cycles = min(eval_window, (float(account.get("completedCycles", self.completed_cycles)) / 140.0) * eval_window)
         elapsed_hours = min(eval_window, max(raw_elapsed, inferred_by_vol, inferred_by_cycles))
 
-        # Continuously record BTC mid price into rolling 180s history on EVERY tick (even while holding positions)
+        # Continuously record BTC mid price into rolling 300s history on EVERY tick (even while holding positions)
         if isinstance(reference, dict) and "btcMidUsd" in reference:
             try:
                 btc_mid_val = float(reference["btcMidUsd"])
                 self.price_history.append((now, btc_mid_val))
-                self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 180.0][-60:]
+                self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 300.0][-60:]
             except (ValueError, TypeError):
                 pass
 
@@ -324,22 +365,21 @@ class ProductionTradingBot:
         if eligible_vol >= TARGET_VOLUME_USD - 1e-4 and position is None:
             self.qualified_and_flat = True
             self._save_state(sync=True)
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         if self.qualified_and_flat and position is None:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # ----------------------------------------------------------------------
         # 2. Market Lifecycle & State Transition
         # ----------------------------------------------------------------------
         if market_id != self.market_id:
             self.market_id = market_id
-            self.position_was_open = False
             self.completed_cycles = 0
             self.last_flat_at = -math.inf
             self.last_buy_attempt_at = -math.inf
-            # Preserve recent 180s price history across markets so momentum/EMA filters aren't skipped on tick 1
-            self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 180.0][-60:]
+            # Preserve recent 300s price history across markets so momentum/EMA filters aren't skipped on tick 1
+            self.price_history = [(t_h, p_h) for t_h, p_h in self.price_history if now - t_h <= 300.0][-60:]
             self.exiting = False
             self.position_entered_at = -math.inf
 
@@ -381,36 +421,36 @@ class ProductionTradingBot:
             side = str(position.get("outcome", "YES"))
             shares = float(position.get("shares", 0.0))
             if shares <= 1e-9:
-                return {"action": "HOLD"}
+                return ACTION_HOLD
 
             # Learning 1 (Jaswanth): Latched Exit — once an exit triggers, keep returning SELL until flat!
             if self.exiting:
-                return {"action": "SELL"}
+                return ACTION_SELL
 
             # If target volume was reached while holding, prioritize immediate exit!
             if eligible_vol >= TARGET_VOLUME_USD:
                 self.exiting = True
                 self._save_state()
-                return {"action": "SELL"}
+                return ACTION_SELL
 
             # Emergency Time Exit: Force SELL before the 15-second pre-expiry lock!
             if seconds_to_close <= EMERGENCY_EXIT_SECONDS:
                 self.exiting = True
                 self._save_state()
-                return {"action": "SELL"}
+                return ACTION_SELL
 
             # Learning 3 (RowletCC): Reverse Signal Cut — dump immediately if BTC gap flips violently
             if isinstance(reference, dict) and not bool(reference.get("targetProvisional", True)):
                 cur_gap = float(reference.get("btcMidUsd", 0)) - float(reference.get("openingTargetUsd", 0))
                 p_scale_exit = max(0.035, min(1.5, float(reference.get("btcMidUsd", 80000.0)) / 80000.0))
-                scaled_rev_gap = BASE_MIN_GAP_USD * p_scale_exit
+                scaled_rev_gap = base_min_gap * p_scale_exit
                 if (side == "YES" and cur_gap < -scaled_rev_gap) or (side == "NO" and cur_gap > scaled_rev_gap):
                     self.exiting = True
                     self._save_state()
-                    return {"action": "SELL"}
+                    return ACTION_SELL
 
-            outcome_book = books.get(side, {})
-            bids = outcome_book.get("bids", [])
+            outcome_book = books.get(side) or {}
+            bids = outcome_book.get("bids") or []
 
             executable = _estimate_sell(bids, shares)
             if executable is not None:
@@ -420,77 +460,80 @@ class ProductionTradingBot:
                 full_cycle_pnl = already_received + sell_gross - sell_fees - paid
 
                 # High-Conviction Gain Harvest: If outcome bid reaches >= 0.94 and trade is in profit, lock it in!
-                best_bid_val = bids[0][0] if (bids and isinstance(bids[0], (list, tuple))) else (sell_gross / shares if shares > 0 else 0.0)
+                parsed_bids = _parse_book_levels(bids, reverse=True)
+                best_bid_val = parsed_bids[0][0] if parsed_bids else (sell_gross / shares if shares > 0 else 0.0)
                 if best_bid_val >= 0.94 and full_cycle_pnl > 0.0:
                     self.exiting = True
                     self._save_state()
-                    return {"action": "SELL"}
+                    return ACTION_SELL
+
+                # Forced Time Exit: Guarantee flat liquidation before expiry freeze
+                if seconds_to_close <= forced_exit_sec:
+                    self.exiting = True
+                    self._save_state()
+                    return ACTION_SELL
 
                 # Avellaneda-Stoikov Dynamic Reservation Price Exit Engine:
-                # - Early holding (t > 85s): Target full profit (+0.02 / share)
+                # - Early holding (t > 85s): Target full profit (+0.025 / share)
                 # - Mid holding (60s < t <= 85s): Take early profit (+0.01 / share)
-                # - Approaching expiry (45s < t <= 60s): Breakeven exit (>= 0.00)
+                # - Pre-Expiry Volume Harvest (50s < t <= 60s): Accept up to -0.03/share spread loss to bank volume
                 dynamic_tp = (
-                    TAKE_PROFIT_PER_SHARE_USD
+                    take_profit
                     if seconds_to_close > 85.0
-                    else (0.01 if seconds_to_close > 60.0 else 0.00)
+                    else (mid_hold_profit if seconds_to_close > 60.0 else pre_expiry_harvest)
                 )
 
                 if full_cycle_pnl >= (dynamic_tp * shares) - 1e-9:
                     self.exiting = True
                     self._save_state()
-                    return {"action": "SELL"}
+                    return ACTION_SELL
 
                 # Stop-Loss: Protect capital against severe reversals
-                if full_cycle_pnl <= -(STOP_LOSS_PER_SHARE_USD * shares) + 1e-9:
+                if full_cycle_pnl <= -(stop_loss * shares) + 1e-9:
                     self.exiting = True
                     self._save_state()
-                    return {"action": "SELL"}
-
-                # Forced Time Exit: Guarantee flat liquidation before expiry lock
-                if seconds_to_close <= FORCED_EXIT_SECONDS:
-                    self.exiting = True
-                    self._save_state()
-                    return {"action": "SELL"}
+                    return ACTION_SELL
             else:
-                if seconds_to_close <= 40.0:
+                if seconds_to_close <= forced_exit_sec:
                     self.exiting = True
                     self._save_state()
-                    return {"action": "SELL"}
+                    return ACTION_SELL
 
-            return {"action": "HOLD"}
+            return ACTION_HOLD
+
+
 
         # ----------------------------------------------------------------------
         # 4. Entry Filters (When Flat)
         # ----------------------------------------------------------------------
         # Safe entry window: Evaluator blocks entries <= 15s; we stop at 50s for exit safety
         if not (ENTRY_MIN_SECONDS_TO_CLOSE < seconds_to_close <= ENTRY_MAX_SECONDS_TO_CLOSE):
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Circuit Breaker: Enforce cooldown if triggered by 3 consecutive losses
         if now < self.cooldown_until:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         if self.completed_cycles >= MAX_CYCLES_PER_MARKET:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         if now - self.last_flat_at < REENTRY_COOLDOWN_SECONDS:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         if now - self.last_buy_attempt_at < REENTRY_COOLDOWN_SECONDS:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Reference validation (Check staleness and provisional flags)
         if not isinstance(reference, dict) or bool(reference.get("targetProvisional", True)):
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         ref_observed_at = float(reference.get("observedAt", -math.inf))
         if now - ref_observed_at > MAX_REFERENCE_AGE_SECONDS or ref_observed_at > now + 1e-9:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         target_observed_at = float(reference.get("targetObservedAt", math.inf))
         if target_observed_at > now + 1e-9:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # ----------------------------------------------------------------------
         # 5. Direction & Mathematical Edge Calculation (The Quant Engine)
@@ -511,7 +554,7 @@ class ProductionTradingBot:
             mean_p = sum(history_prices) / len(history_prices)
             var_p = sum((p - mean_p) ** 2 for p in history_prices) / len(history_prices)
             realized_std = math.sqrt(max(0.0, var_p))
-            dynamic_sigma = max(28.0 * p_scale, min(120.0 * p_scale, realized_std * 2.5))
+            dynamic_sigma = max(28.0 * p_scale, min(120.0 * p_scale, realized_std * vol_scale_mult))
         else:
             dynamic_sigma = 45.0 * p_scale
 
@@ -520,7 +563,7 @@ class ProductionTradingBot:
         if len(self.price_history) >= 2:
             hist_prices = [p for _, p in self.price_history]
             if max(hist_prices) - min(hist_prices) >= spike_limit:
-                return {"action": "HOLD"}
+                return ACTION_HOLD
 
         # Volatility-Scaled Base Regime Gap (Disciplined: never degenerates into noise gambling)
         # Late-Session Finish Push: If healthy cash (>= $8.0) and <= $120 vol needed after 20h, safely lower gap floor
@@ -532,10 +575,11 @@ class ProductionTradingBot:
         ):
             min_required_gap = max(8.0 * p_scale, min(24.0 * p_scale, dynamic_sigma * 0.16))
         else:
-            min_required_gap = max(12.0 * p_scale, min(28.0 * p_scale, dynamic_sigma * 0.22))
+            min_required_gap = max(base_min_gap * p_scale, min(28.0 * p_scale, dynamic_sigma * 0.22))
 
         if abs(gap) < min_required_gap:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
+
 
         # Dynamic volatility over remaining time: sigma * sqrt(tau)
         vol_expected_usd = max(15.0, dynamic_sigma * math.sqrt(tau_min))
@@ -559,9 +603,9 @@ class ProductionTradingBot:
             dt = max(2.0, now - t_ref)
             rev_thresh = (8.0 + (0.25 * dt)) * p_scale
             if gap > 0 and btc_mid < p_ref - rev_thresh:
-                return {"action": "HOLD"}
+                return ACTION_HOLD
             if gap < 0 and btc_mid > p_ref + rev_thresh:
-                return {"action": "HOLD"}
+                return ACTION_HOLD
 
         # Horizon 3: Technical Trend Analysis (EMA Alignment, Linear Velocity & RSI Exhaustion)
         if len(self.price_history) >= 4:
@@ -575,53 +619,53 @@ class ProductionTradingBot:
             # When buying YES, price action must not be in a downward EMA cross or dumping velocity
             if gap > 0:
                 if ema_fast < ema_slow - ema_tol or slope < -0.40 * p_scale:
-                    return {"action": "HOLD"}
+                    return ACTION_HOLD
                 # Overbought Exhaustion Guard: Avoid buying YES into an extreme parabolic top
                 if len(history_prices) >= 8 and _compute_rsi(history_prices) > 92.0:
-                    return {"action": "HOLD"}
+                    return ACTION_HOLD
 
             # When buying NO, price action must not be in an upward EMA cross or pumping velocity
             if gap < 0:
                 if ema_fast > ema_slow + ema_tol or slope > 0.40 * p_scale:
-                    return {"action": "HOLD"}
+                    return ACTION_HOLD
                 # Oversold Bounce Guard: Avoid buying NO into an extreme capitulation bottom
                 if len(history_prices) >= 8 and _compute_rsi(history_prices) < 8.0:
-                    return {"action": "HOLD"}
+                    return ACTION_HOLD
 
         # Select direction with highest probability
         side = "YES" if gap > 0 else "NO"
 
-        outcome_book = books.get(side, {})
-        asks = outcome_book.get("asks", [])
-        bids = outcome_book.get("bids", [])
+        outcome_book = books.get(side) or {}
+        asks = outcome_book.get("asks") or []
+        bids = outcome_book.get("bids") or []
         min_order_size = float(outcome_book.get("minOrderSize", 5.0))
 
         parsed_asks = _parse_book_levels(asks, reverse=False)
         parsed_bids = _parse_book_levels(bids, reverse=True)
         if not parsed_asks or not parsed_bids:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         best_ask = parsed_asks[0][0]
         best_bid = parsed_bids[0][0]
 
         # Book Consensus Agreement: Market book must favor our direction (bid >= 0.48)
         if best_bid < 0.48:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Cross-Book Parity Check: Verify complementary book agreement (reject contradictory books)
         other_side = "NO" if side == "YES" else "YES"
-        other_book = books.get(other_side, {})
-        other_bids = other_book.get("bids", [])
+        other_book = books.get(other_side) or {}
+        other_bids = other_book.get("bids") or []
         parsed_other_bids = _parse_book_levels(other_bids, reverse=True)
         if parsed_other_bids:
             other_best_bid = parsed_other_bids[0][0]
             if other_best_bid > 0.52:
-                return {"action": "HOLD"}
+                return ACTION_HOLD
 
         # Spread Filter: Reject wide spreads (spread > 0.03) to prevent latency loss
         spread = best_ask - best_bid
         if spread > MAX_SPREAD_USD + 1e-9:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Stoikov (2018) Micro-Price & Cont et al. (2014) Order Book Imbalance (OBI) Filter
         v_bid_top = sum(size for _, size in parsed_bids[:2])
@@ -630,29 +674,30 @@ class ProductionTradingBot:
         p_micro = _compute_micro_price(best_bid, best_ask, v_bid_top, v_ask_top)
         p_mid = (best_ask + best_bid) / 2.0
 
-        # Reject if severe ask pressure (OBI < -0.30) or micro-price signals downward tick
-        if obi < -0.30:
-            return {"action": "HOLD"}
+        # Reject if severe ask pressure (OBI < obi_thresh) or micro-price signals downward tick
+        if obi < obi_thresh:
+            return ACTION_HOLD
         if p_micro < p_mid - 0.008:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Bankroll-Tiered Entry Price Ceiling: Prevent buying expensive 0.85-0.92 options when bankroll is small ($10)
         # to avoid asymmetric ruin risk from sharp reversals
         effective_max_ask = 0.75 if cash_usd < 14.0 else (0.82 if cash_usd < 25.0 else MAX_ENTRY_PRICE)
         if not (MIN_ENTRY_PRICE <= best_ask <= effective_max_ask):
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Favorite-Lag Guard: Never pay premium prices (ask >= 0.75) unless the model's win probability
         # is within 1 cent of the ask (target_prob >= best_ask - 0.01). This accommodates normal 1-cent
         # half-spread quotes from market makers while strictly blocking overpriced favorites.
         target_prob = prob_yes if side == "YES" else prob_no
         if best_ask >= 0.75 and target_prob < (best_ask - 0.01):
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Model Directional & Valuation Validation:
         # 1. Require directional conviction from the quant engine
         if target_prob < 0.52:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
+
 
         # 2. Prevent buying overpriced asks where market maker markup exceeds fair spread + fees
         # Normal taker friction (half-spread + protocol/platform fees) is -0.020 to -0.045.
@@ -661,24 +706,24 @@ class ProductionTradingBot:
         breakeven_prob = best_ask + fee_est
         edge = target_prob - breakeven_prob
         if edge < -0.045:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # ----------------------------------------------------------------------
         # 6. Dynamic Position Sizing (Tiered Anti-Ruin & Volume Acceleration Engine)
         # ----------------------------------------------------------------------
-        rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0))
+        rule_max_buy = float(rules.get("maximumBuyCashUsd", 5.0)) if isinstance(rules, dict) else 5.0
         # Available cash limit: Zero reserve during deep drawdown (< $5.00) to allow 5-share recovery purchases;
         # otherwise preserve a $0.15 cushion for fees and rounding.
         available_cash_limit = cash_usd if cash_usd < 5.0 else max(0.0, cash_usd - 0.15)
         # Exact-cost 5-share sizing floor via order book depth simulation (avoids premature lockout at $2.50-$2.68 cash)
         est_5 = _estimate_buy(asks, min_order_size)
         if est_5 is None:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
         gross_5, fees_5 = est_5
         min_5_cost = gross_5 + fees_5 + (BUY_HEADROOM_PER_SHARE * min_order_size)
 
         if cash_usd < min_5_cost:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Risk-Managed Bankroll Sizing & Late-Session Push:
         # Standard: 5-share floor under $12 to prevent drawdown.
@@ -694,14 +739,14 @@ class ProductionTradingBot:
         elif cash_usd < 12.0 or self.consecutive_losses >= 1:
             tier_budget = min_5_cost
         elif cash_usd < 20.0:
-            tier_budget = min(4.88, max(min_5_cost, cash_usd * 0.40))
+            tier_budget = min(4.88, max(min_5_cost, cash_usd * tier2_budget_pct))
         else:
             tier_budget = MAX_BUY_CASH_CEILING
 
         max_spend_budget = min(rule_max_buy, MAX_BUY_CASH_CEILING, tier_budget, available_cash_limit)
 
         if max_spend_budget < 1.0:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Find maximum allowed shares that fit within budget
         optimal_shares = 0.0
@@ -720,18 +765,19 @@ class ProductionTradingBot:
                 break
 
         if optimal_shares < min_order_size:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         # Check immediate exit depth: Ensure bid side has adequate depth
         immediate_exit = _estimate_sell(bids, optimal_shares)
         if immediate_exit is None:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
 
         exit_gross, exit_fees = immediate_exit
         immediate_roundtrip_loss = optimal_cash - (exit_gross - exit_fees)
         # Reject if instantaneous spread loss exceeds $0.075 per share (allows 1c-2c spreads, blocks wide 3c+)
         if immediate_roundtrip_loss > 0.075 * optimal_shares + 1e-9:
-            return {"action": "HOLD"}
+            return ACTION_HOLD
+
 
         # Learning 2 (Jaswanth): Add execution headroom buffer to prevent sub-minOrderSize rejections
         # during 250ms quote movement, capped strictly under max_spend_budget and MAX_BUY_CASH_CEILING
@@ -754,6 +800,32 @@ BOT = ProductionTradingBot()
 
 class DecideRequestHandler(BaseHTTPRequestHandler):
     """Production HTTP handler strictly following POST /decide contract."""
+
+    def setup(self) -> None:
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in ("/health", "/status"):
+            with BOT._lock:
+                status_payload = {
+                    "status": "healthy",
+                    "qualified": BOT.qualified_and_flat,
+                    "completedCycles": BOT.completed_cycles,
+                    "consecutiveLosses": BOT.consecutive_losses,
+                    "lastCashUsd": BOT.pre_trade_cash_usd,
+                }
+            resp_bytes = json.dumps(status_payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            self.end_headers()
+            self.wfile.write(resp_bytes)
+            return
+        self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path != "/decide":
@@ -778,6 +850,7 @@ class DecideRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: Any) -> None:
         """Suppress standard logging to ensure sub-millisecond response latency."""
         return
+
 
 
 def run_server(port: int = 8080) -> None:
