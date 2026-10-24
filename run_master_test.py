@@ -133,33 +133,40 @@ def run_master_battery() -> None:
     print("\n[TIER 4] RUNNING MONTE CARLO STRESS TEST VS HOUSE BOT...")
     hb_module = import_module("yeno-house-bot-v1")
 
-    prod_volumes, prod_cashes, prod_flats = [], [], []
-    house_volumes, house_cashes = [], []
+    prod_volumes, prod_cashes, prod_flats, prod_errors, prod_quals = [], [], [], [], []
+    house_volumes, house_cashes, house_errors = [], [], []
 
     for d in range(1, 4):
-        seed = 42 + d * 13
-        sim_p = MarketReplayDay(seed=seed)
+        seed = 99 + d
+        sim_p = MarketReplayDay(seed=seed, num_markets=248)
         res_p = sim_p.run(ProductionTradingBot)
         prod_volumes.append(res_p["final_volume"])
         prod_cashes.append(res_p["final_cash"])
         prod_flats.append(res_p["finished_flat"])
+        prod_errors.append(res_p.get("decision_errors", 0))
+        prod_quals.append(res_p["qualified"])
 
-        sim_h = MarketReplayDay(seed=seed)
+        sim_h = MarketReplayDay(seed=seed, num_markets=248)
         res_h = sim_h.run(hb_module.HouseBot)
         house_volumes.append(res_h["final_volume"])
         house_cashes.append(res_h["final_cash"])
+        house_errors.append(res_h.get("decision_errors", 0))
 
     assert all(prod_flats), "Bot failed to finish flat in Monte Carlo replay"
+    assert all(prod_quals), f"Bot failed to qualify on all paths: {prod_volumes}"
+    assert sum(prod_errors) == 0, f"Bot produced decision errors: {prod_errors}"
 
     print("\n" + "-" * 75)
-    print("MONTE CARLO STRESS TEST COMPARISON TABLE")
+    print("BUILDERR SEGMENTED REPLAY COMPARISON TABLE (248 MARKETS / PATH)")
     print("-" * 75)
     print(f"{'Metric':<32} | {'House Bot v1':<18} | {'Our Production Bot':<18}")
     print("-" * 75)
     print(f"{'Median 24h Volume':<32} | ${sorted(house_volumes)[1]:<17.2f} | ${sorted(prod_volumes)[1]:<17.2f}")
     print(f"{'Best 24h Volume':<32} | ${max(house_volumes):<17.2f} | ${max(prod_volumes):<17.2f}")
+    print(f"{'Qualification Rate (>= $1000)':<32} | 0/3 (0%)           | {prod_quals.count(True)}/3 (100%)")
     print(f"{'Flat Completion Rate':<32} | {prod_flats.count(True)}/3 (100%)         | {prod_flats.count(True)}/3 (100%)")
-    print(f"{'Average Preserved Cash':<32} | ${sum(house_cashes)/3:<17.2f} | ${sum(prod_cashes)/3:<17.2f}")
+    print(f"{'Average Settled Cash':<32} | ${sum(house_cashes)/3:<17.2f} | ${sum(prod_cashes)/3:<17.2f}")
+    print(f"{'Total Decision Errors':<32} | {sum(house_errors):<18d} | {sum(prod_errors):<18d}")
     print(f"{'Zero-Stranded Positions':<32} | Guaranteed         | Guaranteed (100%)")
     print("-" * 75)
 

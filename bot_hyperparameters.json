@@ -1,11 +1,11 @@
 {
-  "base_min_gap": 10.0,
-  "vol_scale_mult": 2.3,
-  "take_profit": 0.025,
-  "mid_hold_profit": 0.01,
-  "pre_expiry_harvest": -0.025,
-  "stop_loss": 0.13,
-  "forced_exit_sec": 49.0,
-  "obi_threshold": -0.25,
-  "tier2_budget_pct": 0.35
+  "base_min_gap": 14.0,
+  "vol_scale_mult": 1.8,
+  "take_profit": 0.14,
+  "mid_hold_profit": 0.10,
+  "pre_expiry_harvest": 0.06,
+  "stop_loss": 0.09,
+  "forced_exit_sec": 42.0,
+  "obi_threshold": -0.30,
+  "tier2_budget_pct": 0.48
 }
